@@ -1,0 +1,1016 @@
+<html>
+  <head>
+    
+    <link rel="stylesheet" href="./assets/markdown.css" type="text/css" />
+    <link rel="stylesheet" href="./assets/code.css" type="text/css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="page">
+        <a name="Hemingway"><h1>Hemingway</h1>
+</a><p>A tool for turning markdown-based literate programs into HTML. Inspired by
+<a href="http://www.literateprogramming.com/knuthweb.pdf">Knuth</a> and
+<a href="http://fitzgen.github.io/pycco/">pycco</a> (and its ilk). This isn't the full
+literate programming model as envisioned by Knuth but an attempt to get some
+of the benefits without requiring extensions to the source language.</p>
+<a name="BasicUsage"><h2>Basic usage</h2>
+</a><p>Hemingway is intended to be run on a collection of files located under the
+same root directory. You specify the argument like so,</p>
+<pre><code>hemingway --root path/to/src "**/*.c" "**/*.h"
+</code></pre>
+<p>What this means is: starting from <code>path/to/src</code>, find all files that match
+the globs <code>**/*.c</code> and <code>**/*.h</code> relative to that root and convert them. The
+output will be stored in a subdirectory, <code>doc/</code> by default, also using paths
+relative to the root. So <code>path/to/src/foo/bar/baz.c</code> will be converted to
+<code>doc/foo/bar/baz.c.html</code>. See</p>
+<pre><code>hemingway --help
+</code></pre>
+<p>for an overview of all the options supported by the tool.</p>
+<a name="Watchdog"><h2>Watchdog</h2>
+</a><p>Besides doing batch conversion Hemingway also supports live editing. If you
+pass the <code>--watchdog</code> flag the script won't terminate, instead it will watch
+the file system and re-convert any files that change. To end the program just
+Ctrl-C it.</p>
+<a name="Implementation"><h2>Implementation</h2>
+</a><p>The script has a few different components that each have a separate
+responsibility in the process. To keep things simple and not have to worry
+about <code>$PYTHONPATH</code> everything is in this one file.</p>
+<ul>
+<li>The <a href="#SourceIndex">index</a> keeps track of the files to convert. During
+    initialization it locates all the files that match the arguments. After
+    that it answers queries from the other components but the index stays the
+    same.</li>
+<li>The <a href="#Scheduler">scheduler</a> schedules file conversions. It's has an
+    async queue which other parts of the program can add conversions to and
+    then the scheduler takes care of getting the conversions done.</li>
+<li>The <a href="#Conversion">conversion</a> code does the actual work of splitting
+    the source of a file into code and comment parts and then converting
+    each part appropriately.</li>
+<li>The file handling (open, closing, watching) is done by the <a href="#Main">main</a>
+    class.</li>
+</ul>
+<p>The <a href="#UnitTests">please_run_the_tests</a> function runs the unit
+tests.</p><div class="codehilite"><div class="hll"><pre><span class="kn">import</span> <span class="nn">argparse</span>
+<span class="kn">import</span> <span class="nn">glob</span>
+<span class="kn">import</span> <span class="nn">logging</span>
+<span class="kn">import</span> <span class="nn">os.path</span>
+<span class="kn">import</span> <span class="nn">Queue</span>
+<span class="kn">import</span> <span class="nn">re</span>
+<span class="kn">import</span> <span class="nn">sys</span>
+<span class="kn">import</span> <span class="nn">threading</span>
+</pre></div>
+</div><p>Import the nonstandard libraries defensively since they are more likely than
+the others to fail and theres a reasonable action the user can take to fix
+the issue.</p><div class="codehilite"><div class="hll"><pre><span class="c"># Try importing markdown to see whether it&#39;s available.</span>
+<span class="k">try</span><span class="p">:</span>
+  <span class="kn">import</span> <span class="nn">markdown</span>
+<span class="k">except</span> <span class="ne">ImportError</span><span class="p">,</span> <span class="n">e</span><span class="p">:</span>
+  <span class="k">print</span> <span class="s">&quot;Hemingway requires the markdown package. Try &#39;pip install markdown&#39;.&quot;</span>
+
+<span class="c"># Try importing pygments to see whether it&#39;s available.</span>
+<span class="k">try</span><span class="p">:</span>
+  <span class="kn">import</span> <span class="nn">pygments</span>
+<span class="k">except</span> <span class="ne">ImportError</span><span class="p">,</span> <span class="n">e</span><span class="p">:</span>
+  <span class="k">print</span> <span class="s">&quot;Hemingway requires the pygments package. Try &#39;pip install pygments&#39;.&quot;</span>
+
+<span class="kn">import</span> <span class="nn">pkg_resources</span>
+
+<span class="c"># Import the subpackages we&#39;re actually going to use.</span>
+<span class="kn">import</span> <span class="nn">markdown.extensions</span>
+<span class="kn">import</span> <span class="nn">markdown.inlinepatterns</span>
+<span class="kn">import</span> <span class="nn">markdown.preprocessors</span>
+<span class="kn">import</span> <span class="nn">markdown.treeprocessors</span>
+<span class="kn">import</span> <span class="nn">markdown.util</span>
+<span class="kn">import</span> <span class="nn">pygments.formatters</span>
+<span class="kn">import</span> <span class="nn">pygments.lexers</span>
+
+
+<span class="n">_HTML_TEMPLATE</span> <span class="o">=</span> <span class="s">&quot;&quot;&quot;</span><span class="se">\</span>
+<span class="s">&lt;html&gt;</span>
+<span class="s">  &lt;head&gt;</span>
+<span class="s">    </span><span class="si">%(header)s</span><span class="s"></span>
+<span class="s">    &lt;link rel=&quot;stylesheet&quot; href=&quot;</span><span class="si">%(assets)s</span><span class="s">/markdown.css&quot; type=&quot;text/css&quot; /&gt;</span>
+<span class="s">    &lt;link rel=&quot;stylesheet&quot; href=&quot;</span><span class="si">%(assets)s</span><span class="s">/code.css&quot; type=&quot;text/css&quot; /&gt;</span>
+<span class="s">  &lt;/head&gt;</span>
+<span class="s">  &lt;body&gt;</span>
+<span class="s">    &lt;div class=&quot;container&quot;&gt;</span>
+<span class="s">      &lt;div class=&quot;page&quot;&gt;</span>
+<span class="s">        </span><span class="si">%(contents)s</span><span class="s"></span>
+<span class="s">      &lt;/div&gt;</span>
+<span class="s">    &lt;/div&gt;</span>
+<span class="s">  &lt;/body&gt;</span>
+<span class="s">&lt;/html&gt;</span>
+<span class="s">&quot;&quot;&quot;</span>
+</pre></div>
+</div><a name="MarkdownExtensions"><h2>Markdown extensions</h2>
+</a><p>To support the integration of markdown with source code it's convenient to
+add a few extensions to the markdown processor. Luckily the python markdown
+framework has an api intended to allow exactly the kinds of extensions that
+we want. Good work guys. The extensions are,</p>
+<ul>
+<li><a href="#CrossReferences">Cross references</a>. The ability to create references
+    to other source files and program elements and have the processor resolve
+    them to HTML links. The syntax is <code>{{ref}}(title)</code> where the title is
+    optional.</li>
+<li><a href="#AutomaticAnchorNames">Automatic anchor names</a>. This is a post-processor
+    that adds anchor names to generated markdown headers such that the cross
+    references have something to link to besides just toplevel files.</li>
+</ul><a name="CrossReferences"><h3>Cross References</h3>
+</a><p>The cross reference syntax fits pretty nicely into the markdown library's
+inline pattern API hook. The framework matches based on the regexp passed to
+the constructor and then we perform a secondary match on the contents of the
+cross reference.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="CrossRefPattern"><span class="nc">CrossRefPattern</span></a><span class="p">(</span><span class="n">markdown</span><span class="o">.</span><span class="n">inlinepatterns</span><span class="o">.</span><span class="n">Pattern</span><span class="p">):</span>
+
+  <span class="n">MARKUP_PATTERN</span> <span class="o">=</span> <span class="s">r&quot;\{\{([^\{\}]*)\}\}(?:\(([^)]+)\))?&quot;</span>
+  <span class="n">TARGET_PATTERN</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="s">r&quot;([^#]*)(#.*)?&quot;</span><span class="p">)</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+    <span class="nb">super</span><span class="p">(</span><span class="n">CrossRefPattern</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">__init__</span><span class="p">(</span><span class="n">CrossRefPattern</span><span class="o">.</span><span class="n">MARKUP_PATTERN</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">context</span>
+
+  <span class="k">def</span> <a name="handleMatch"><span class="nf">handleMatch</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">match</span><span class="p">):</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="n">title</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">3</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">title</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="n">title</span> <span class="o">=</span> <span class="n">name</span>
+    <span class="n">ref_match</span> <span class="o">=</span> <span class="n">CrossRefPattern</span><span class="o">.</span><span class="n">TARGET_PATTERN</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+    <span class="n">filename</span> <span class="o">=</span> <span class="n">ref_match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">anchor</span> <span class="o">=</span> <span class="n">ref_match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">filename</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="o">==</span> <span class="s">&quot;&quot;</span><span class="p">:</span>
+      <span class="n">destination</span> <span class="o">=</span> <span class="s">&quot;&quot;</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="n">destination</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">resolve_cross_reference</span><span class="p">(</span><span class="n">filename</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">destination</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="n">element</span> <span class="o">=</span> <span class="n">markdown</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">etree</span><span class="o">.</span><span class="n">Element</span><span class="p">(</span><span class="s">&#39;em&#39;</span><span class="p">)</span>
+      <span class="n">element</span><span class="o">.</span><span class="n">text</span> <span class="o">=</span> <span class="n">title</span>
+      <span class="k">return</span> <span class="n">element</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="k">if</span> <span class="ow">not</span> <span class="n">anchor</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+        <span class="n">destination</span> <span class="o">+=</span> <span class="n">anchor</span>
+      <span class="n">element</span> <span class="o">=</span> <span class="n">markdown</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">etree</span><span class="o">.</span><span class="n">Element</span><span class="p">(</span><span class="s">&#39;a&#39;</span><span class="p">)</span>
+      <span class="n">element</span><span class="o">.</span><span class="n">text</span> <span class="o">=</span> <span class="n">title</span>
+      <span class="n">element</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="s">&quot;href&quot;</span><span class="p">,</span> <span class="n">destination</span><span class="p">)</span>
+      <span class="k">return</span> <span class="n">element</span>
+</pre></div>
+</div><a name="AutomaticAnchorNames"><h3>Automatic Anchor Names</h3>
+</a><p>This tree processor takes an element tree that is about to be serialized and
+adds named anchors to all the headers such that they can be linked to from
+cross references.</p>
+<p>Again the markdown library has a convenient API that lets us traverse the
+DOM before it gets serialized and wrap all headers in appropriately named
+anchors.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="AutoAnchorProcessor"><span class="nc">AutoAnchorProcessor</span></a><span class="p">(</span><span class="n">markdown</span><span class="o">.</span><span class="n">treeprocessors</span><span class="o">.</span><span class="n">Treeprocessor</span><span class="p">):</span>
+
+  <span class="n">TAGS_TO_ANCHOR</span> <span class="o">=</span> <span class="p">[</span><span class="s">&#39;h1&#39;</span><span class="p">,</span> <span class="s">&#39;h2&#39;</span><span class="p">,</span> <span class="s">&#39;h3&#39;</span><span class="p">]</span>
+
+  <span class="c"># Recursively find all headers and interject anchor nodes around them.</span>
+  <span class="k">def</span> <a name="extend_headers"><span class="nf">extend_headers</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">markdown</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">etree</span><span class="o">.</span><span class="n">iselement</span><span class="p">(</span><span class="n">node</span><span class="p">):</span>
+      <span class="n">child_index</span> <span class="o">=</span> <span class="mi">0</span>
+      <span class="k">while</span> <span class="n">child_index</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">node</span><span class="p">):</span>
+        <span class="n">child</span> <span class="o">=</span> <span class="n">node</span><span class="p">[</span><span class="n">child_index</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">extend_headers</span><span class="p">(</span><span class="n">child</span><span class="p">)</span>
+        <span class="n">new_child</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_extended_header</span><span class="p">(</span><span class="n">child</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">new_child</span> <span class="ow">is</span> <span class="n">child</span><span class="p">:</span>
+          <span class="n">node</span><span class="p">[</span><span class="n">child_index</span><span class="p">]</span> <span class="o">=</span> <span class="n">new_child</span>
+        <span class="n">child_index</span> <span class="o">+=</span> <span class="mi">1</span>
+
+  <span class="c"># Given a node, if it is a header returns a replacement with an anchor</span>
+  <span class="c"># otherwise returns the node itself.</span>
+  <span class="k">def</span> <a name="get_extended_header"><span class="nf">get_extended_header</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">):</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">tag</span> <span class="ow">in</span> <span class="n">AutoAnchorProcessor</span><span class="o">.</span><span class="n">TAGS_TO_ANCHOR</span><span class="p">:</span>
+      <span class="k">return</span> <span class="n">node</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">AutoAnchorProcessor</span><span class="o">.</span><span class="n">get_node_text</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="n">AutoAnchorProcessor</span><span class="o">.</span><span class="n">header_to_anchor_name</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+    <span class="n">anchor</span> <span class="o">=</span> <span class="n">markdown</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">etree</span><span class="o">.</span><span class="n">Element</span><span class="p">(</span><span class="s">&#39;a&#39;</span><span class="p">)</span>
+    <span class="n">anchor</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="s">&quot;name&quot;</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+    <span class="n">anchor</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">anchor</span>
+
+  <span class="c"># Given the raw text contents of a header returns the anchor name to use.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="header_to_anchor_name"><span class="nf">header_to_anchor_name</span></a><span class="p">(</span><span class="n">text</span><span class="p">):</span>
+    <span class="c"># Strip out any non alpha numeric characters. Convert them to spaces so they</span>
+    <span class="c"># contribute to the titlecase behavior below.</span>
+    <span class="n">alnum</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span><span class="s">r&quot;\W&quot;</span><span class="p">,</span> <span class="s">&quot; &quot;</span><span class="p">,</span> <span class="n">text</span><span class="p">)</span>
+    <span class="c"># Split the string by spaces.</span>
+    <span class="n">raw_parts</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s">r&quot;\s+&quot;</span><span class="p">,</span> <span class="n">alnum</span><span class="p">)</span>
+    <span class="c"># Capitalize the first character in each part.</span>
+    <span class="n">cap_parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">part</span><span class="o">.</span><span class="n">title</span><span class="p">()</span> <span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">raw_parts</span><span class="p">]</span>
+    <span class="c"># Join the parts back together.</span>
+    <span class="k">return</span> <span class="s">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">cap_parts</span><span class="p">)</span>
+
+  <span class="c"># Returns just the raw text contained in a given node.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="get_node_text"><span class="nf">get_node_text</span></a><span class="p">(</span><span class="n">node</span><span class="p">):</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">text</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">markdown</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">etree</span><span class="o">.</span><span class="n">iselement</span><span class="p">(</span><span class="n">node</span><span class="p">):</span>
+      <span class="k">for</span> <span class="n">child</span> <span class="ow">in</span> <span class="n">node</span><span class="p">:</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">AutoAnchorProcessor</span><span class="o">.</span><span class="n">get_node_text</span><span class="p">(</span><span class="n">child</span><span class="p">))</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">tail</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">tail</span><span class="p">)</span>
+    <span class="k">return</span> <span class="s">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">result</span><span class="p">)</span>
+
+  <span class="c"># The method called by the framework.  </span>
+  <span class="k">def</span> <a name="run"><span class="nf">run</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">extend_headers</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">root</span>
+</pre></div>
+</div><a name="ExtensionHook"><h3>Extension hook</h3>
+</a><p>The hook used to install the hemingway extension into the markdown processor.
+This is somewhat cargo-cult, I'm not sure what the scope is of an extension
+(I assume it's just the current markdown object) and I'm not clear on exactly
+what <code>not_strong</code> is.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="HemingwayExtension"><span class="nc">HemingwayExtension</span></a><span class="p">(</span><span class="n">markdown</span><span class="o">.</span><span class="n">extensions</span><span class="o">.</span><span class="n">Extension</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">context</span>
+
+  <span class="k">def</span> <a name="extendMarkdown"><span class="nf">extendMarkdown</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">md</span><span class="p">,</span> <span class="nb">globals</span><span class="p">):</span>
+    <span class="n">md</span><span class="o">.</span><span class="n">inlinePatterns</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="s">&#39;crossref&#39;</span><span class="p">,</span> <span class="n">CrossRefPattern</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="p">),</span> <span class="s">&#39;&gt;not_strong&#39;</span><span class="p">)</span>
+    <span class="n">md</span><span class="o">.</span><span class="n">treeprocessors</span><span class="p">[</span><span class="s">&#39;autoanchor&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">AutoAnchorProcessor</span><span class="p">()</span>
+</pre></div>
+</div><a name="SourceIndex"><h2>Source index</h2>
+</a><p>This class is responsible for looking through the file system and sorting out
+which files to convert. This all happens at startup in <a href="#IndexLoad">load</a>.
+After loading its main responsibility is resolving cross-references between
+the source files. That happens in <a href="#ResolvingCrossReferences">resolve_cross_reference</a>.
+For each source file there's a <a href="#SourceFile">source file</a> object that
+keeps track of the meta-information we need about the file.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="SourceIndex"><span class="nc">SourceIndex</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">,</span> <span class="n">patterns</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">root</span> <span class="o">=</span> <span class="n">root</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">patterns</span> <span class="o">=</span> <span class="n">patterns</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">sources</span> <span class="o">=</span> <span class="bp">None</span>
+
+  <span class="c"># Generates all the source files in sorted order.</span>
+  <span class="k">def</span> <a name="list_sources"><span class="nf">list_sources</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">abspath</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sources</span><span class="o">.</span><span class="n">keys</span><span class="p">()):</span>
+      <span class="n">source</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sources</span><span class="p">[</span><span class="n">abspath</span><span class="p">]</span>
+      <span class="k">yield</span> <span class="n">source</span>
+
+  <span class="c"># Returns the source file that corresponds to the given absolute path. If no</span>
+  <span class="c"># file exists None is returned.</span>
+  <span class="k">def</span> <a name="get_absolute_source"><span class="nf">get_absolute_source</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">path</span><span class="p">):</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">sources</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="bp">None</span><span class="p">)</span>
+</pre></div>
+</div><a name="IndexLoad"><h3>Index load</h3>
+</a><p>Loading the index is pretty straightforward, <code>glob</code> does all the work. We
+need to know both the absolute and relative paths for each file which would
+be easy if <code>glob</code> worked relative to a given path (in this case the root).
+Alas it doesn't so we have to join the root and paths together and then
+remove the root again from the files. If the root has no trailing path
+separator that is particularly sticky because one will be added by glob, so
+we ensure at the top that it does.</p><div class="codehilite"><div class="hll"><pre>  <span class="k">def</span> <a name="load"><span class="nf">load</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">sources</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">sep</span><span class="p">):</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">root</span> <span class="o">+=</span> <span class="n">os</span><span class="o">.</span><span class="n">sep</span>
+    <span class="k">for</span> <span class="n">pattern</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">patterns</span><span class="p">:</span>
+      <span class="n">path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">,</span> <span class="n">pattern</span><span class="p">)</span>
+      <span class="k">for</span> <span class="n">rootpath</span> <span class="ow">in</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">path</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">rootpath</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">):</span>
+          <span class="k">raise</span> <span class="ne">AssertionError</span><span class="p">(</span><span class="s">&quot;Found </span><span class="si">%s</span><span class="s"> under </span><span class="si">%s</span><span class="s">?&quot;</span> <span class="o">%</span> <span class="p">(</span><span class="n">rootpath</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">))</span>
+        <span class="n">relpath</span> <span class="o">=</span> <span class="n">rootpath</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">):]</span>
+        <span class="n">abspath</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">abspath</span><span class="p">(</span><span class="n">rootpath</span><span class="p">)</span>
+        <span class="n">sources</span><span class="p">[</span><span class="n">abspath</span><span class="p">]</span> <span class="o">=</span> <span class="n">SourceFile</span><span class="p">(</span><span class="n">relpath</span><span class="p">,</span> <span class="n">abspath</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">sources</span> <span class="o">=</span> <span class="n">sources</span>
+</pre></div>
+</div><a name="ResolvingCrossReferences"><h3>Resolving cross references</h3>
+</a><p>Cross references can be specified using short paths, so if there is a file
+called <code>foo/bar/baz.c</code> you can refer to it just as <code>baz.c</code>. The current
+implementation is kind of a hack but that's because I'd want to see what
+use cases are for more complex references before attempting to add support.</p>
+<p>Once a target has been found we need to strip the common prefix between the
+place where the reference will appear and the target, since otherwise it
+messes up the relative path.</p><div class="codehilite"><div class="hll"><pre>  <span class="k">def</span> <a name="resolve_cross_reference"><span class="nf">resolve_cross_reference</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">whos_asking</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">source</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">list_sources</span><span class="p">():</span>
+      <span class="k">if</span> <span class="n">source</span><span class="o">.</span><span class="n">relpath</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="n">name</span><span class="p">):</span>
+        <span class="n">target_out</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">get_relative_output_path</span><span class="p">()</span>
+        <span class="n">asking_out</span> <span class="o">=</span> <span class="n">whos_asking</span><span class="o">.</span><span class="n">get_relative_output_path</span><span class="p">()</span>
+        <span class="n">prefix</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">commonprefix</span><span class="p">([</span><span class="n">target_out</span><span class="p">,</span> <span class="n">asking_out</span><span class="p">])</span>
+        <span class="k">return</span> <span class="n">target_out</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">prefix</span><span class="p">):]</span>
+    <span class="k">return</span> <span class="bp">None</span>
+</pre></div>
+</div><a name="SourceFile"><h3>Source File</h3>
+</a><p>A source file encapsulates the nitty-gritty of where the file is and what the
+output path is.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="SourceFile"><span class="nc">SourceFile</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">relpath</span><span class="p">,</span> <span class="n">abspath</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">relpath</span> <span class="o">=</span> <span class="n">relpath</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">abspath</span> <span class="o">=</span> <span class="n">abspath</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">language</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">for_file</span><span class="p">(</span><span class="n">abspath</span><span class="p">)</span>
+
+  <span class="c"># Reads and returns the contents of this source file.</span>
+  <span class="k">def</span> <a name="read"><span class="nf">read</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="nb">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">abspath</span><span class="p">,</span> <span class="s">&quot;rt&quot;</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+      <span class="n">contents</span> <span class="o">=</span> <span class="n">port</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+    <span class="k">finally</span><span class="p">:</span>
+      <span class="n">port</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">contents</span>
+
+  <span class="c"># Returns the language info describing this file.</span>
+  <span class="k">def</span> <a name="get_language"><span class="nf">get_language</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">language</span>
+
+  <span class="c"># Returns the output path to use for this file given that the output</span>
+  <span class="c"># directory root is the given path.</span>
+  <span class="k">def</span> <a name="get_absolute_output_path"><span class="nf">get_absolute_output_path</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">outdir</span><span class="p">):</span>
+    <span class="n">relpath</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_relative_output_path</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">outdir</span><span class="p">,</span> <span class="n">relpath</span><span class="p">)</span>
+
+  <span class="c"># Returns a relative path to the output corresponding to this file.</span>
+  <span class="k">def</span> <a name="get_relative_output_path"><span class="nf">get_relative_output_path</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="s">&quot;</span><span class="si">%s</span><span class="s">.html&quot;</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">relpath</span>
+
+  <span class="k">def</span> <a name="__str__"><span class="nf">__str__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="s">&quot;source </span><span class="si">%s</span><span class="s">&quot;</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">relpath</span>
+</pre></div>
+</div><a name="Scheduler"><h2>Scheduler</h2>
+</a><p>The scheduler is responsible for getting files converted. It runs
+asynchronously which may seem like an odd choice but it's really convenient
+to be able to reserve the main thread for the watchdog functionality and then
+have the conversion take place in the background on a different thread.</p>
+<p>The only part of the scheduler that's slightly complicated is the fact that
+when you ask it to stop (using <code>finish_up</code>) it doesn't stop immediately, it
+completes any pending conversion requests first. That way the non-watchdog
+version can get it started and ask it to finish immediately and then rely on
+it finishing up nicely.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="Scheduler"><span class="nc">Scheduler</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">context</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">Queue</span><span class="o">.</span><span class="n">Queue</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">keep_going</span> <span class="o">=</span> <span class="bp">True</span>
+
+  <span class="c"># Spawns the scheduler thread then returns immediately.</span>
+  <span class="k">def</span> <a name="start"><span class="nf">start</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">process</span><span class="p">)</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+
+  <span class="c"># Loop around processing conversions until asked to stop and the queue is</span>
+  <span class="c"># empty.</span>
+  <span class="k">def</span> <a name="process"><span class="nf">process</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">while</span> <span class="bp">self</span><span class="o">.</span><span class="n">keep_going</span> <span class="ow">or</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">empty</span><span class="p">()):</span>
+      <span class="nb">next</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">True</span><span class="p">)</span>
+      <span class="k">if</span> <span class="nb">next</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+        <span class="k">return</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">convert_file</span><span class="p">(</span><span class="nb">next</span><span class="p">)</span>
+
+  <span class="k">def</span> <a name="finish_up"><span class="nf">finish_up</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">keep_going</span> <span class="o">=</span> <span class="bp">False</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="bp">None</span><span class="p">)</span>
+
+  <span class="k">def</span> <a name="schedule"><span class="nf">schedule</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+</pre></div>
+</div><a name="Conversion"><h2>Conversion</h2>
+</a><p>The source conversion process happens in two steps:</p>
+<ol>
+<li>First the source is <a href="#Chopping">chopped into</a> contiguous comment and
+     code blocks according to the syntax of the <a href="#LanguageProcessing">language</a>.</li>
+<li>Then each block is asked to <a href="#BlockConversion">convert</a> its lines
+     which it does either using the custom
+     <a href="#MarkdownExtensions">markdown processor</a> or custom 
+     <a href="#PygmentsExtensions">pygments formatter</a>.</li>
+</ol><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="Converter"><span class="nc">Converter</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">context</span>
+    <span class="n">extension</span> <span class="o">=</span> <span class="n">HemingwayExtension</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">markdown</span> <span class="o">=</span> <span class="n">markdown</span><span class="o">.</span><span class="n">Markdown</span><span class="p">(</span><span class="n">extensions</span><span class="o">=</span><span class="p">[</span><span class="s">&#39;footnotes&#39;</span><span class="p">,</span> <span class="n">extension</span><span class="p">])</span>
+
+  <span class="c"># Converts the text of a source file, returning the result as a string.</span>
+  <span class="k">def</span> <a name="convert_source"><span class="nf">convert_source</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">):</span>
+    <span class="n">contents</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+    <span class="n">language</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">get_language</span><span class="p">()</span>
+    <span class="n">lines</span> <span class="o">=</span> <span class="n">contents</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()</span>
+    <span class="n">blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">chop_into_blocks</span><span class="p">(</span><span class="n">language</span><span class="p">,</span> <span class="n">lines</span><span class="p">)</span>
+    <span class="n">results</span> <span class="o">=</span> <span class="p">[</span><span class="n">block</span><span class="o">.</span><span class="n">to_html</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">blocks</span><span class="p">]</span>
+    <span class="n">body</span> <span class="o">=</span> <span class="s">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">results</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">_HTML_TEMPLATE</span> <span class="o">%</span> <span class="p">{</span>
+      <span class="s">&quot;header&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">get_headers</span><span class="p">(),</span>
+      <span class="s">&quot;contents&quot;</span><span class="p">:</span> <span class="n">body</span><span class="p">,</span>
+      <span class="s">&quot;assets&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_assets_path</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+    <span class="p">}</span>
+
+  <span class="k">def</span> <a name="get_assets_path"><span class="nf">get_assets_path</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">origin</span><span class="p">):</span>
+    <span class="n">depth</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+    <span class="n">last_parent</span> <span class="o">=</span> <span class="n">origin</span><span class="o">.</span><span class="n">relpath</span>
+    <span class="n">parent</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="n">last_parent</span><span class="p">)</span>
+    <span class="k">while</span> <span class="n">parent</span> <span class="o">!=</span> <span class="n">last_parent</span><span class="p">:</span>
+      <span class="n">last_parent</span> <span class="o">=</span> <span class="n">parent</span>
+      <span class="n">parent</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
+      <span class="n">depth</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="k">if</span> <span class="n">depth</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+      <span class="n">relative</span> <span class="o">=</span> <span class="s">&quot;.&quot;</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="n">relative</span> <span class="o">=</span> <span class="s">&quot;/&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">([</span><span class="s">&quot;..&quot;</span><span class="p">]</span> <span class="o">*</span> <span class="n">depth</span><span class="p">)</span>
+    <span class="k">return</span> <span class="s">&quot;</span><span class="si">%s</span><span class="s">/assets&quot;</span> <span class="o">%</span> <span class="n">relative</span>
+</pre></div>
+</div><a name="Chopping"><h3>Chopping</h3>
+</a><p>The lines of the source is chopped into blocks really straightforwardly:
+for each line, ask the language if it's a comment. If the type of the line
+is the same as the block we're building, keep building. Otherwise flush the
+current block and start a new one. Lines can be ignored in which case we
+just skip past them (which lines to ignore is user configurable) and whole
+blocks can be ignored, specifically empty code blocks which don't really
+makes sense. Empty comment blocks are keps because the render as vertical
+space and it turns out to look wrong if they're stripped.</p>
+<p>Of special consideration are hashbangs which are always ignored at the top
+of a file.</p><div class="codehilite"><div class="hll"><pre>  <span class="c"># Given a list of lines returns a list of blocks where each block contains a</span>
+  <span class="c"># contiguous list of lines of the same type, code or comment.</span>
+  <span class="k">def</span> <a name="chop_into_blocks"><span class="nf">chop_into_blocks</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">language</span><span class="p">,</span> <span class="n">lines</span><span class="p">):</span>
+    <span class="n">blocks</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">CurrentType</span> <span class="o">=</span> <span class="n">CodeBlock</span>
+    <span class="n">current_lines</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">def</span> <a name="add_block"><span class="nf">add_block</span></a><span class="p">(</span><span class="n">block</span><span class="p">):</span>
+      <span class="k">if</span> <span class="ow">not</span> <span class="n">block</span><span class="o">.</span><span class="n">is_empty</span><span class="p">():</span>
+        <span class="n">blocks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+    <span class="n">is_beginning</span> <span class="o">=</span> <span class="bp">True</span>
+    <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">lines</span><span class="p">:</span>
+      <span class="k">if</span> <span class="n">is_beginning</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+          <span class="k">if</span> <span class="n">line</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s">&quot;#!&quot;</span><span class="p">):</span>
+            <span class="k">continue</span>
+        <span class="k">finally</span><span class="p">:</span>
+          <span class="n">is_beginning</span> <span class="o">=</span> <span class="bp">False</span>
+      <span class="k">if</span> <span class="n">language</span><span class="o">.</span><span class="n">is_ignored</span><span class="p">(</span><span class="n">line</span><span class="p">):</span>
+        <span class="k">continue</span>
+      <span class="k">if</span> <span class="n">language</span><span class="o">.</span><span class="n">is_comment</span><span class="p">(</span><span class="n">line</span><span class="p">):</span>
+        <span class="n">NextType</span> <span class="o">=</span> <span class="n">CommentBlock</span>
+      <span class="k">else</span><span class="p">:</span>
+        <span class="n">NextType</span> <span class="o">=</span> <span class="n">CodeBlock</span>
+      <span class="k">if</span> <span class="n">NextType</span> <span class="o">!=</span> <span class="n">CurrentType</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">current_lines</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+          <span class="n">add_block</span><span class="p">(</span><span class="n">CurrentType</span><span class="p">(</span><span class="n">current_lines</span><span class="p">,</span> <span class="n">language</span><span class="p">))</span>
+        <span class="n">CurrentType</span> <span class="o">=</span> <span class="n">NextType</span>
+        <span class="n">current_lines</span> <span class="o">=</span> <span class="p">[]</span>
+      <span class="n">current_lines</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">line</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">current_lines</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+      <span class="n">add_block</span><span class="p">(</span><span class="n">CurrentType</span><span class="p">(</span><span class="n">current_lines</span><span class="p">,</span> <span class="n">language</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">blocks</span>
+
+  <span class="c"># Convertes the given text using the shared markdown converter.</span>
+  <span class="k">def</span> <a name="convert_markdown"><span class="nf">convert_markdown</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">):</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">markdown</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div><a name="BlockConversion"><h3>Block conversion</h3>
+</a><p>The two types of blocks, <a href="#CommentBlocks">comments</a> and
+<a href="#CodeBlocks">code</a>, each have their own way to do conversion. An
+alternative approach would be to convert everything as markdown with a
+preprocessor step that converts the code blocks and wraps them in <code>&lt;div&gt;</code>s.
+I actually tried that and it was painfully slow, presumably because the
+pygments output is large which slows down markdown processing.</p>
+<a name="CommentBlocks"><h3>Comment blocks</h3>
+</a><p>Comment blocks produce their output by stripping the literate comment marker
+(plus one space if present, which is usually is) and then just passing the
+result as a block to the <a href="#Converter">converter</a> to be markdowned.
+Initially I stripped all the whitespace after the marker but since whitespace
+is significant in markdown that turned out the be a bad choice.</p><div class="codehilite"><div class="hll"><pre><span class="c"># A contiguous block of end-of-line comments to be markdowned.</span>
+<span class="k">class</span> <a name="CommentBlock"><span class="nc">CommentBlock</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lines</span><span class="p">,</span> <span class="n">language</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">lines</span> <span class="o">=</span> <span class="n">lines</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">language</span> <span class="o">=</span> <span class="n">language</span>
+
+  <span class="k">def</span> <a name="is_empty"><span class="nf">is_empty</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="bp">False</span>
+
+  <span class="k">def</span> <a name="to_html"><span class="nf">to_html</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+    <span class="n">marker</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">language</span><span class="o">.</span><span class="n">get_marker</span><span class="p">()</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">lines</span><span class="p">:</span>
+      <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">CommentBlock</span><span class="o">.</span><span class="n">strip_marker</span><span class="p">(</span><span class="n">marker</span><span class="p">,</span> <span class="n">line</span><span class="p">))</span>
+    <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s">&quot;&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">context</span><span class="o">.</span><span class="n">convert_markdown</span><span class="p">(</span><span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">result</span><span class="p">))</span>
+
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="strip_marker"><span class="nf">strip_marker</span></a><span class="p">(</span><span class="n">marker</span><span class="p">,</span> <span class="n">line</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">marker</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="k">return</span> <span class="n">line</span>
+    <span class="n">index</span> <span class="o">=</span> <span class="n">line</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="n">marker</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">index</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+      <span class="k">return</span> <span class="n">line</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="n">removed</span> <span class="o">=</span> <span class="n">line</span><span class="p">[</span><span class="n">index</span><span class="o">+</span><span class="nb">len</span><span class="p">(</span><span class="n">marker</span><span class="p">):]</span>
+      <span class="k">if</span> <span class="n">removed</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s">&quot; &quot;</span><span class="p">):</span>
+        <span class="n">removed</span> <span class="o">=</span> <span class="n">removed</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span>
+      <span class="k">return</span> <span class="n">removed</span>
+</pre></div>
+</div><a name="PygmentsExtensions"><h3>Pygments extensions</h3>
+</a><p>It's convenient to have anchors added to type and function names in the
+pygments output. For this we're using a custom formatter that scans each
+line of output for those and wraps them in anchors. It's not the ideal
+approach but it works; how well also depends on how the language lexer
+chooses to annotate the source code. For instance, it does well with
+python but not nearly as well with C. In python the word <code>Foo</code> in
+<code>class Foo</code> and <code>f = Foo()</code> are annotated differently, the first is a class
+name and the second is just a name, whereas in C <code>typedef Foo</code> and <code>Foo f</code> 
+are annotated the same which means that we can't distinguish which is the
+declaration.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="CustomHtmlFormatter"><span class="nc">CustomHtmlFormatter</span></a><span class="p">(</span><span class="n">pygments</span><span class="o">.</span><span class="n">formatters</span><span class="o">.</span><span class="n">HtmlFormatter</span><span class="p">):</span>
+
+  <span class="n">PATTERN</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="s">r&quot;(&lt;span class=</span><span class="se">\&quot;</span><span class="s">(?:nc|nf)</span><span class="se">\&quot;</span><span class="s">&gt;([^&gt;]*)&lt;/span&gt;)&quot;</span><span class="p">)</span>
+  <span class="n">TEMPLATE</span> <span class="o">=</span> <span class="s">&quot;&lt;a name=</span><span class="se">\&quot;</span><span class="si">%s</span><span class="se">\&quot;</span><span class="s">&gt;</span><span class="si">%s</span><span class="s">&lt;/a&gt;&quot;</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="nb">super</span><span class="p">(</span><span class="n">CustomHtmlFormatter</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">__init__</span><span class="p">(</span><span class="n">cssclass</span><span class="o">=</span><span class="s">&#39;hll&#39;</span><span class="p">)</span>
+
+  <span class="c"># Overide the default wrapper implementation.</span>
+  <span class="k">def</span> <a name="wrap"><span class="nf">wrap</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">,</span> <span class="n">outfile</span><span class="p">):</span>
+    <span class="n">transformed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transform_lines</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nb">super</span><span class="p">(</span><span class="n">CustomHtmlFormatter</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">wrap</span><span class="p">(</span><span class="n">transformed</span><span class="p">,</span> <span class="n">outfile</span><span class="p">)</span>
+
+  <span class="c"># The transformed source must be a generator so this method returns one that</span>
+  <span class="c"># generates the transformed output.</span>
+  <span class="k">def</span> <a name="transform_lines"><span class="nf">transform_lines</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">):</span>
+    <span class="k">for</span> <span class="p">(</span><span class="n">depth</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span> <span class="ow">in</span> <span class="n">source</span><span class="p">:</span>
+      <span class="n">new_line</span> <span class="o">=</span> <span class="n">CustomHtmlFormatter</span><span class="o">.</span><span class="n">PATTERN</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span>
+        <span class="n">CustomHtmlFormatter</span><span class="o">.</span><span class="n">inject_anchor</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span>
+      <span class="k">yield</span> <span class="p">(</span><span class="n">depth</span><span class="p">,</span> <span class="n">new_line</span><span class="p">)</span>
+
+  <span class="c"># Given a match for the span pattern above, returns a string that wraps the</span>
+  <span class="c"># match appropriately in an anchor.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="inject_anchor"><span class="nf">inject_anchor</span></a><span class="p">(</span><span class="n">match</span><span class="p">):</span>
+    <span class="n">everything</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">CustomHtmlFormatter</span><span class="o">.</span><span class="n">TEMPLATE</span> <span class="o">%</span> <span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">everything</span><span class="p">)</span>
+</pre></div>
+</div><a name="CodeBlocks"><h3>Code blocks</h3>
+</a><p>Code blocks are converted using the lexer that was used to construct the
+<a href="#DeterminingTheLanguage">language</a>. Pretty straightforward.</p><div class="codehilite"><div class="hll"><pre><span class="c"># A block of source code to be formatted using pygments.</span>
+<span class="k">class</span> <a name="CodeBlock"><span class="nc">CodeBlock</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="n">FORMATTER</span> <span class="o">=</span> <span class="n">CustomHtmlFormatter</span><span class="p">()</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lines</span><span class="p">,</span> <span class="n">language</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">language</span> <span class="o">=</span> <span class="n">language</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">lines</span> <span class="o">=</span> <span class="n">lines</span>
+
+  <span class="k">def</span> <a name="is_empty"><span class="nf">is_empty</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="s">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lines</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span> <span class="o">==</span> <span class="mi">0</span>
+
+  <span class="k">def</span> <a name="to_html"><span class="nf">to_html</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+    <span class="n">highlighted</span> <span class="o">=</span> <span class="n">pygments</span><span class="o">.</span><span class="n">highlight</span><span class="p">(</span><span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lines</span><span class="p">),</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">language</span><span class="o">.</span><span class="n">get_lexer</span><span class="p">(),</span> <span class="n">CodeBlock</span><span class="o">.</span><span class="n">FORMATTER</span><span class="p">)</span>
+    <span class="k">return</span> <span class="s">&quot;&lt;div class=</span><span class="se">\&quot;</span><span class="s">codehilite</span><span class="se">\&quot;</span><span class="s">&gt;</span><span class="si">%s</span><span class="s">&lt;/div&gt;&quot;</span> <span class="o">%</span> <span class="n">highlighted</span>
+</pre></div>
+</div><a name="LanguageProcessing"><h2>Language Processing</h2>
+</a><p>The language specific processing is all done by the <code>LanguageInfo</code> class.
+The information is siphoned out of pygments -- it knows the syntax of the
+languages and it's feasible to extract it in a lot of cases. Besides the
+defaults there are some hardcoded overrides, and longer term it should be
+possible to specify custom overrides probably via YAML.</p><div class="codehilite"><div class="hll"><pre><span class="n">_LANGUAGE_OVERRIDES</span> <span class="o">=</span> <span class="p">{</span>
+  <span class="s">&quot;C&quot;</span><span class="p">:</span> <span class="p">{</span>
+    <span class="s">&quot;comments&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s">r&quot;//.*$&quot;</span><span class="p">]</span>
+  <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c"># Collection of information needed to process a file in a particular language.</span>
+<span class="k">class</span> <a name="LanguageInfo"><span class="nc">LanguageInfo</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lexer</span><span class="p">,</span> <span class="n">marker</span><span class="p">,</span> <span class="n">ignore</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">lexer</span> <span class="o">=</span> <span class="n">lexer</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">marker</span> <span class="o">=</span> <span class="n">marker</span>
+    <span class="k">if</span> <span class="n">ignore</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">ignore</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">ignore</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">ignore</span><span class="p">)</span>
+
+  <span class="c"># Returns the pygments lexer to use for this language.</span>
+  <span class="k">def</span> <a name="get_lexer"><span class="nf">get_lexer</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lexer</span>
+
+  <span class="c"># Returns the marker used to identify the lines that contain documentation.</span>
+  <span class="k">def</span> <a name="get_marker"><span class="nf">get_marker</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">marker</span>
+
+  <span class="c"># Is the given line an end-of-line comment within this language?</span>
+  <span class="k">def</span> <a name="is_comment"><span class="nf">is_comment</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">line</span><span class="p">):</span>
+    <span class="n">stripped</span> <span class="o">=</span> <span class="n">line</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">stripped</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">marker</span><span class="p">)</span>
+
+  <span class="k">def</span> <a name="is_ignored"><span class="nf">is_ignored</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">line</span><span class="p">):</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ignore</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="k">return</span> <span class="bp">False</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">ignore</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">line</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
+</pre></div>
+</div><a name="DeterminingTheLanguage"><h3>Determining the language</h3>
+</a><p>The language for a file is determined from the filename using pygments.
+As it happens, this is incredibly slow for some reason. The lexer is then
+analyzed: we need to know what the end-of-line
+<a href="#DeterminingTheInitial">comment syntax</a> is and which
+<a href="#DeterminingTheMarker">marker</a> to use for literate comments. 
+Alternatively, if any of these values have been specified explicitly we
+don't try to infer them but just use the overrides.</p><div class="codehilite"><div class="hll"><pre>  <span class="c"># Tries to produce a language info for the source file with the given name</span>
+  <span class="c"># by querying pygments.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="for_file"><span class="nf">for_file</span></a><span class="p">(</span><span class="n">filename</span><span class="p">):</span>
+    <span class="n">lexer</span> <span class="o">=</span> <span class="n">pygments</span><span class="o">.</span><span class="n">lexers</span><span class="o">.</span><span class="n">get_lexer_for_filename</span><span class="p">(</span><span class="n">filename</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">for_lexer</span><span class="p">(</span><span class="n">lexer</span><span class="p">)</span>
+
+  <span class="n">cache</span> <span class="o">=</span> <span class="p">{}</span>
+
+  <span class="c"># Returns a language descriptor for the given pygments lexer. If no language</span>
+  <span class="c"># can be constructed None is returned.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="for_lexer"><span class="nf">for_lexer</span></a><span class="p">(</span><span class="n">lexer</span><span class="p">):</span>
+    <span class="n">marker</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="n">comments</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="n">overrides</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="n">ignore</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="c"># Grab the name if possible.</span>
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">lexer</span><span class="p">,</span> <span class="s">&#39;name&#39;</span><span class="p">):</span>
+      <span class="n">name</span> <span class="o">=</span> <span class="n">lexer</span><span class="o">.</span><span class="n">name</span>
+      <span class="c"># Now that we have the name check if we&#39;ve created this language info</span>
+      <span class="c"># before.</span>
+      <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">cache</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">cache</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+      <span class="k">else</span><span class="p">:</span>
+        <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">cache</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="n">name</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="c"># Prime the variables with the overrides -- if the values are set we don&#39;t</span>
+    <span class="c"># do any work below to try to infer them.</span>
+    <span class="n">overrides</span> <span class="o">=</span> <span class="n">_LANGUAGE_OVERRIDES</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="bp">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="n">comments</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;comments&quot;</span><span class="p">,</span> <span class="bp">None</span><span class="p">)</span>
+      <span class="n">marker</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;marker&quot;</span><span class="p">,</span> <span class="bp">None</span><span class="p">)</span>
+      <span class="n">ignore</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;ignore&quot;</span><span class="p">,</span> <span class="bp">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">comments</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="c"># If comments haven&#39;t been set explicitly and the lexer doesn&#39;t have</span>
+      <span class="c"># tokens (that we can see) we have to give up.</span>
+      <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">lexer</span><span class="p">,</span> <span class="s">&#39;tokens&#39;</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">None</span>
+      <span class="n">comments</span> <span class="o">=</span> <span class="p">[]</span>
+      <span class="k">for</span> <span class="n">matcher</span> <span class="ow">in</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">flatten_list_dicts</span><span class="p">(</span><span class="n">lexer</span><span class="o">.</span><span class="n">tokens</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">matcher</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">):</span>
+          <span class="k">continue</span>
+        <span class="n">action</span> <span class="o">=</span> <span class="n">matcher</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">action</span> <span class="ow">in</span> <span class="n">pygments</span><span class="o">.</span><span class="n">token</span><span class="o">.</span><span class="n">Comment</span><span class="p">:</span>
+          <span class="n">comments</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">matcher</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">marker</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">ignore</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">):</span>
+      <span class="c"># If the initial hasn&#39;t been set explicitly try to infer it from the</span>
+      <span class="c"># comments.</span>
+      <span class="k">for</span> <span class="n">comment</span> <span class="ow">in</span> <span class="n">comments</span><span class="p">:</span>
+        <span class="n">initial</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">initial_from_regexp</span><span class="p">(</span><span class="n">comment</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">initial</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+          <span class="k">if</span> <span class="n">marker</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+            <span class="n">marker</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">marker_from_initial</span><span class="p">(</span><span class="n">initial</span><span class="p">)</span>
+          <span class="k">if</span> <span class="n">ignore</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+            <span class="n">ignore</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">ignore_from_initial</span><span class="p">(</span><span class="n">initial</span><span class="p">)</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="p">(</span><span class="n">lexer</span><span class="p">,</span> <span class="n">marker</span><span class="p">,</span> <span class="n">ignore</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">name</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">cache</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">result</span>
+    <span class="k">return</span> <span class="n">result</span>
+
+  <span class="c"># Given a dict whose values are lists returns a list that is the concatenation</span>
+  <span class="c"># of the list values. If some of the values are themselves list-dicts they are</span>
+  <span class="c"># traversed and flattened recursively.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="flatten_list_dicts"><span class="nf">flatten_list_dicts</span></a><span class="p">(</span><span class="n">root</span><span class="p">):</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">def</span> <a name="add_values"><span class="nf">add_values</span></a><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+      <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">for</span> <span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span> <span class="ow">in</span> <span class="n">value</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+          <span class="n">add_values</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+      <span class="k">else</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">elm</span> <span class="ow">in</span> <span class="n">value</span><span class="p">:</span>
+          <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">elm</span><span class="p">)</span>
+    <span class="n">add_values</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">result</span>
+</pre></div>
+</div><a name="DeterminingTheInitial"><h3>Determining the initial</h3>
+</a><p>This is the cheesiest part, extracting the string that starts and
+end-of-line comment from a regexp that matches it. Generally they look
+the same (something like <code>#.*$</code> or <code>^\s*%.*\n</code> etc.) which can be matched
+by a regexp (yes, a meta-regexp). If we can't then it's fine to fall back
+on explicit defaults.</p><div class="codehilite"><div class="hll"><pre>  <span class="c"># Given a regexp that is presumed to match end-of-line comments attempts to</span>
+  <span class="c"># extract the characters that start the comments. If this is not possible</span>
+  <span class="c"># None is returned.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="initial_from_regexp"><span class="nf">initial_from_regexp</span></a><span class="p">(</span><span class="n">regexp</span><span class="p">):</span>
+    <span class="n">match</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">_INITIAL_REGEXP</span><span class="p">,</span> <span class="n">regexp</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">match</span><span class="p">:</span>
+      <span class="k">return</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="bp">None</span>
+</pre></div>
+</div><a name="DeterminingTheMarker"><h3>Determining the marker</h3>
+</a><p>This is also cheesy: it just doubles the last initial character. So if
+end-of-line comments start at <code>#</code> then the literate comment marker will be
+<code>##</code>. Again these are only defaults, longer term they can be overridden.</p><div class="codehilite"><div class="hll"><pre>  <span class="c"># Given an end-of-line comment initial returns a documentation marker by just</span>
+  <span class="c"># doubling the last character.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="marker_from_initial"><span class="nf">marker_from_initial</span></a><span class="p">(</span><span class="n">initial</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">initial</span> <span class="o">+</span> <span class="n">initial</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+
+  <span class="c"># Given an end-of-line comment initial returns an ignore marker. Just adds a</span>
+  <span class="c"># minus at the end.</span>
+  <span class="nd">@staticmethod</span>
+  <span class="k">def</span> <a name="ignore_from_initial"><span class="nf">ignore_from_initial</span></a><span class="p">(</span><span class="n">initial</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">initial</span> <span class="o">+</span> <span class="s">&quot;-&quot;</span>
+
+
+<span class="c"># This is just the regexp used above split into separate parts to make it</span>
+<span class="c"># easier to read.</span>
+<span class="n">_COMMENT_PREFIX</span> <span class="o">=</span> <span class="s">r&quot;^\^?(?:</span><span class="se">\\</span><span class="s">s\*)?&quot;</span>
+<span class="n">_INITIAL_CHARS</span> <span class="o">=</span> <span class="s">r&quot;((?:#|</span><span class="se">\\</span><span class="s">|/|</span><span class="se">\&quot;</span><span class="s">|;|@|!|%)+)&quot;</span>
+<span class="n">_COMMENT_SUFFIX</span> <span class="o">=</span> <span class="s">r&quot;\.\*\??(?:\$|</span><span class="se">\\</span><span class="s">n)?$&quot;</span>
+<span class="n">_INITIAL_REGEXP</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">_COMMENT_PREFIX</span> <span class="o">+</span> <span class="n">_INITIAL_CHARS</span> <span class="o">+</span> <span class="n">_COMMENT_SUFFIX</span><span class="p">)</span>
+</pre></div>
+</div><a name="Main"><h2>Main</h2>
+</a><p>The main class ties everything together (man). It handles
+<a href="#build_option_parser">flag parsing</a>, runs the
+<a href="#RunningTheWatchdog">watchdog</a>, and handles
+<a href="#WritingTheOutput">writing the output</a>.</p><div class="codehilite"><div class="hll"><pre><span class="k">class</span> <a name="Hemingway"><span class="nc">Hemingway</span></a><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+
+  <span class="n">LOG_FORMAT</span> <span class="o">=</span> <span class="s">&quot;</span><span class="si">%(levelname)s</span><span class="s">: </span><span class="si">%(message)s</span><span class="s">&quot;</span>
+
+  <span class="k">def</span> <a name="__init__"><span class="nf">__init__</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">args</span><span class="p">):</span>
+    <span class="n">parser</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_option_parser</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">options</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">initialize_logging</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">validate_options</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">index</span> <span class="o">=</span> <span class="n">SourceIndex</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">root</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">pattern</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">current_source</span> <span class="o">=</span> <span class="bp">None</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">scheduler</span> <span class="o">=</span> <span class="n">Scheduler</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">converter</span> <span class="o">=</span> <span class="n">Converter</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+
+  <span class="c"># Configure logging appropriately.</span>
+  <span class="k">def</span> <a name="initialize_logging"><span class="nf">initialize_logging</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">loglevel</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">log</span>
+    <span class="n">level_value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">logging</span><span class="p">,</span> <span class="n">loglevel</span><span class="o">.</span><span class="n">upper</span><span class="p">())</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">basicConfig</span><span class="p">(</span><span class="n">format</span><span class="o">=</span><span class="n">Hemingway</span><span class="o">.</span><span class="n">LOG_FORMAT</span><span class="p">,</span> <span class="n">level</span><span class="o">=</span><span class="n">level_value</span><span class="p">)</span>
+
+  <span class="c"># Main entry-point for actually performing the conversion.</span>
+  <span class="k">def</span> <a name="run"><span class="nf">run</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">profile</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">run_with_profile</span><span class="p">()</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">run_no_profile</span><span class="p">()</span>
+
+  <span class="k">def</span> <a name="run_with_profile"><span class="nf">run_with_profile</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="kn">import</span> <span class="nn">cProfile</span>
+    <span class="kn">import</span> <span class="nn">pstats</span>
+    <span class="n">profile</span> <span class="o">=</span> <span class="n">cProfile</span><span class="o">.</span><span class="n">Profile</span><span class="p">()</span>
+    <span class="n">profile</span><span class="o">.</span><span class="n">enable</span><span class="p">()</span>
+    <span class="k">try</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">run_no_profile</span><span class="p">()</span>
+    <span class="k">finally</span><span class="p">:</span>
+      <span class="n">profile</span><span class="o">.</span><span class="n">disable</span><span class="p">()</span>
+      <span class="n">stats</span> <span class="o">=</span> <span class="n">pstats</span><span class="o">.</span><span class="n">Stats</span><span class="p">(</span><span class="n">profile</span><span class="p">)</span>
+      <span class="n">stats</span><span class="o">.</span><span class="n">sort_stats</span><span class="p">(</span><span class="s">&#39;cumtime&#39;</span><span class="p">)</span>
+      <span class="n">stats</span><span class="o">.</span><span class="n">print_stats</span><span class="p">(</span><span class="mi">32</span><span class="p">)</span>
+
+  <span class="c"># Does what .run says it does but where run also takes care of profiling this</span>
+  <span class="c"># one just does the conversion.</span>
+  <span class="k">def</span> <a name="run_no_profile"><span class="nf">run_no_profile</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">index</span><span class="o">.</span><span class="n">load</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">source</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">index</span><span class="o">.</span><span class="n">list_sources</span><span class="p">():</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">scheduler</span><span class="o">.</span><span class="n">schedule</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">copy_assets</span><span class="p">()</span>
+    <span class="k">try</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">scheduler</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+      <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">watchdog</span><span class="p">:</span>
+        <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s">&quot;Watching for file changes under </span><span class="si">%s</span><span class="s">&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">root</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">run_watchdog</span><span class="p">()</span>
+    <span class="k">finally</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">scheduler</span><span class="o">.</span><span class="n">finish_up</span><span class="p">()</span>
+</pre></div>
+</div><a name="RunningTheWatchdog"><h3>Running the watchdog</h3>
+</a><p>The watchdog is actually totally straightforward: all the work is done
+by the python <code>watchdog</code> library. For simplicity watchdog watches the
+whole root directory and then filters out files we're not interested in by
+asking the index whether it knows about files that have changed.
+On any changes the files are dropped into the scheduler's queue which does
+the rest.</p><div class="codehilite"><div class="hll"><pre>  <span class="k">def</span> <a name="run_watchdog"><span class="nf">run_watchdog</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="kn">import</span> <span class="nn">time</span>
+    <span class="kn">import</span> <span class="nn">watchdog</span>
+    <span class="kn">import</span> <span class="nn">watchdog.observers</span>
+    <span class="kn">import</span> <span class="nn">watchdog.events</span>
+    <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span>
+    <span class="k">class</span> <a name="EventHandler"><span class="nc">EventHandler</span></a><span class="p">(</span><span class="n">watchdog</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">FileSystemEventHandler</span><span class="p">):</span>
+      <span class="k">def</span> <a name="on_any_event"><span class="nf">on_any_event</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">):</span>
+        <span class="n">context</span><span class="o">.</span><span class="n">on_watchdog_event</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+    <span class="n">observer</span> <span class="o">=</span> <span class="n">watchdog</span><span class="o">.</span><span class="n">observers</span><span class="o">.</span><span class="n">Observer</span><span class="p">()</span>
+    <span class="n">observer</span><span class="o">.</span><span class="n">schedule</span><span class="p">(</span><span class="n">EventHandler</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">root</span><span class="p">,</span> <span class="n">recursive</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+    <span class="n">observer</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+    <span class="k">while</span> <span class="bp">True</span><span class="p">:</span>
+      <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+  <span class="c"># Fired by watchdog whenever a file changes.</span>
+  <span class="k">def</span> <a name="on_watchdog_event"><span class="nf">on_watchdog_event</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">):</span>
+    <span class="n">path</span> <span class="o">=</span> <span class="n">event</span><span class="o">.</span><span class="n">src_path</span>
+    <span class="n">source</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">index</span><span class="o">.</span><span class="n">get_absolute_source</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">source</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">scheduler</span><span class="o">.</span><span class="n">schedule</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+</pre></div>
+</div><a name="WritingTheOutput"><h3>Writing the output</h3>
+</a><p>While the conversion itself it delegated to the converter, writing the
+output to a file is done here. The source object knows where it will be
+written too (it needs to know to know how to resolve cross references)
+so all we have to do here is ensure that the file can be written and then
+do it.</p><div class="codehilite"><div class="hll"><pre>  <span class="c"># Converts a source file, writing the results into the output file.</span>
+  <span class="k">def</span> <a name="convert_file"><span class="nf">convert_file</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">):</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s">&quot;Processing </span><span class="si">%s</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">source</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">current_source</span> <span class="o">=</span> <span class="n">source</span>
+    <span class="n">markdown</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">converter</span><span class="o">.</span><span class="n">convert_source</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+    <span class="n">output_file</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">get_absolute_output_path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">out</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">ensure_parent_folder</span><span class="p">(</span><span class="n">output_file</span><span class="p">)</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_file</span><span class="p">,</span> <span class="s">&quot;wt&quot;</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+      <span class="n">port</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">markdown</span><span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+      <span class="bp">self</span><span class="o">.</span><span class="n">current_source</span> <span class="o">=</span> <span class="bp">None</span>
+      <span class="n">port</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+  <span class="c"># Given a file, ensures that its parent folder has been created.</span>
+  <span class="k">def</span> <a name="ensure_parent_folder"><span class="nf">ensure_parent_folder</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">path</span><span class="p">):</span>
+    <span class="n">parent</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">parent</span><span class="p">):</span>
+      <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
+
+  <span class="c"># Writes the assets into the output directory.</span>
+  <span class="k">def</span> <a name="copy_assets"><span class="nf">copy_assets</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">asset_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">out</span><span class="p">,</span> <span class="s">&#39;assets&#39;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">asset_path</span><span class="p">):</span>
+      <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">asset_path</span><span class="p">)</span>
+    <span class="n">markdown</span> <span class="o">=</span> <span class="n">pkg_resources</span><span class="o">.</span><span class="n">resource_string</span><span class="p">(</span><span class="n">__name__</span><span class="p">,</span> <span class="s">&quot;assets/markdown-default.css&quot;</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">copy_asset</span><span class="p">(</span><span class="n">markdown</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">asset_path</span><span class="p">,</span> <span class="s">&quot;markdown.css&quot;</span><span class="p">))</span>
+    <span class="c"># Pygments comes with some style sheets so just copy one of those.</span>
+    <span class="n">formatter</span> <span class="o">=</span> <span class="n">pygments</span><span class="o">.</span><span class="n">formatters</span><span class="o">.</span><span class="n">HtmlFormatter</span><span class="p">(</span><span class="n">style</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">pygments_style</span><span class="p">)</span>
+    <span class="n">code</span> <span class="o">=</span> <span class="n">formatter</span><span class="o">.</span><span class="n">get_style_defs</span><span class="p">(</span><span class="s">&#39;.codehilite&#39;</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">copy_asset</span><span class="p">(</span><span class="n">code</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">asset_path</span><span class="p">,</span> <span class="s">&quot;code.css&quot;</span><span class="p">))</span>
+
+  <span class="k">def</span> <a name="copy_asset"><span class="nf">copy_asset</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">source</span><span class="p">,</span> <span class="n">target</span><span class="p">):</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s">&quot;Creating asset </span><span class="si">%s</span><span class="s">&quot;</span><span class="p">,</span> <span class="n">target</span><span class="p">)</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="nb">open</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="s">&quot;wt&quot;</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+      <span class="n">port</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+      <span class="n">port</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+  <span class="c"># Returns any extra headers to insert into the HTML output.</span>
+  <span class="k">def</span> <a name="get_headers"><span class="nf">get_headers</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="c"># Automatically enable refresh in watchdog mode.</span>
+    <span class="n">refresh</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">refresh</span>
+    <span class="k">if</span> <span class="n">refresh</span> <span class="ow">is</span> <span class="bp">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">watchdog</span><span class="p">:</span>
+      <span class="n">refresh</span> <span class="o">=</span> <span class="s">&quot;10&quot;</span>
+    <span class="k">if</span> <span class="n">refresh</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+      <span class="k">return</span> <span class="s">&quot;&quot;</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="k">return</span> <span class="s">&quot;&lt;meta http-equiv=</span><span class="se">\&quot;</span><span class="s">refresh</span><span class="se">\&quot;</span><span class="s"> content=</span><span class="se">\&quot;</span><span class="si">%s</span><span class="se">\&quot;</span><span class="s">/&gt;&quot;</span> <span class="o">%</span> <span class="n">refresh</span>
+
+
+  <span class="c"># Returns the source file referred to by the given cross reference.</span>
+  <span class="k">def</span> <a name="resolve_cross_reference"><span class="nf">resolve_cross_reference</span></a><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+    <span class="n">whos_asking</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">current_source</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">index</span><span class="o">.</span><span class="n">resolve_cross_reference</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">whos_asking</span><span class="p">)</span>
+
+  <span class="c"># Builds and returns a new option parser for the flags understood by this</span>
+  <span class="c"># script.</span>
+  <span class="k">def</span> <a name="build_option_parser"><span class="nf">build_option_parser</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--out&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s">&#39;doc&#39;</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;Root directory of the output. Default &#39;doc&#39;.&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--root&#39;</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;Root directory where the input lives.&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--profile&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="bp">False</span><span class="p">,</span> <span class="n">action</span><span class="o">=</span><span class="s">&quot;store_true&quot;</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;Dump a profile on program exit.&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--watchdog&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="bp">False</span><span class="p">,</span> <span class="n">action</span><span class="o">=</span><span class="s">&quot;store_true&quot;</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;Use watchdog to convert files as they change.&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--refresh&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="bp">None</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;If set, inserts a refresh meta-tag in the output html.&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--pygments-style&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s">&quot;default&quot;</span><span class="p">,</span> <span class="n">dest</span><span class="o">=</span><span class="s">&quot;pygments_style&quot;</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;Which formatter style to use for the generated output&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;--log&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s">&#39;INFO&#39;</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s">&quot;Log level to use.&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s">&#39;pattern&#39;</span><span class="p">,</span> <span class="n">nargs</span><span class="o">=</span><span class="s">&#39;+&#39;</span><span class="p">,</span>
+      <span class="n">help</span><span class="o">=</span><span class="s">&quot;Globs (for instance &#39;**/*.c&#39;) used to locate files under the root&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">parser</span>
+
+  <span class="c"># Checks that the given options are valid.</span>
+  <span class="k">def</span> <a name="validate_options"><span class="nf">validate_options</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">all_styles</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">pygments</span><span class="o">.</span><span class="n">styles</span><span class="o">.</span><span class="n">get_all_styles</span><span class="p">())</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">pygments_style</span> <span class="ow">in</span> <span class="n">all_styles</span><span class="p">:</span>
+      <span class="k">print</span> <span class="s">&quot;Unknown --pygments-style &#39;</span><span class="si">%s</span><span class="s">&#39;&quot;</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">options</span><span class="o">.</span><span class="n">pygments_style</span>
+      <span class="k">print</span> <span class="s">&quot;The available styles are: </span><span class="si">%s</span><span class="s">&quot;</span> <span class="o">%</span> <span class="s">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">all_styles</span><span class="p">)</span>
+      <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+
+<span class="k">def</span> <a name="main"><span class="nf">main</span></a><span class="p">():</span>
+  <span class="n">main</span> <span class="o">=</span> <span class="n">Hemingway</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
+  <span class="k">try</span><span class="p">:</span>
+    <span class="n">main</span><span class="o">.</span><span class="n">run</span><span class="p">()</span>
+  <span class="k">except</span> <span class="ne">KeyboardInterrupt</span><span class="p">,</span> <span class="n">ki</span><span class="p">:</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s">&quot;Interrupted; exiting.&quot;</span><span class="p">)</span>
+    <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+</pre></div>
+</div><a name="UnitTests"><h2>Unit tests.</h2>
+</a><p>This function runs all the tests. Everything is wrapped in a function rather
+than at toplevel because the script shouldn't depend on unittest being
+available unless you're actually going to run the tests. This still adds some
+overhead to running script -- whether you run them or not they have to be
+parsed -- but it shouldn't be too bad.</p>
+<p>The <a href="#test_language_infos">#test_language_infos</a> test is more for development than an actual 
+test. Also, it takes a long time to run.</p><div class="codehilite"><div class="hll"><pre><span class="k">def</span> <a name="please_run_the_tests"><span class="nf">please_run_the_tests</span></a><span class="p">():</span>
+  <span class="kn">import</span> <span class="nn">unittest</span>
+
+  <span class="c"># Unit tests for hemingway.</span>
+  <span class="k">class</span> <a name="HemingwayTest"><span class="nc">HemingwayTest</span></a><span class="p">(</span><span class="n">unittest</span><span class="o">.</span><span class="n">TestCase</span><span class="p">):</span>
+
+    <span class="c"># Generates all the lexers known by pygment.</span>
+    <span class="k">def</span> <a name="list_pygment_lexers"><span class="nf">list_pygment_lexers</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+      <span class="k">for</span> <span class="n">lexer_tuple</span> <span class="ow">in</span> <span class="n">pygments</span><span class="o">.</span><span class="n">lexers</span><span class="o">.</span><span class="n">get_all_lexers</span><span class="p">():</span>
+        <span class="n">long_name</span> <span class="o">=</span> <span class="n">lexer_tuple</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">aliases</span> <span class="o">=</span> <span class="n">lexer_tuple</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="n">all_names</span> <span class="o">=</span> <span class="p">[</span><span class="n">long_name</span><span class="p">]</span> <span class="o">+</span> <span class="nb">list</span><span class="p">(</span><span class="n">aliases</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">all_names</span><span class="p">:</span>
+          <span class="k">try</span><span class="p">:</span>
+            <span class="n">lexer</span> <span class="o">=</span> <span class="n">pygments</span><span class="o">.</span><span class="n">lexers</span><span class="o">.</span><span class="n">get_lexer_by_name</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+            <span class="k">yield</span> <span class="n">lexer</span>
+            <span class="k">break</span>
+          <span class="k">except</span> <span class="n">pygments</span><span class="o">.</span><span class="n">lexers</span><span class="o">.</span><span class="n">ClassNotFound</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+    <span class="k">def</span> <a name="test_initial_from_regexp"><span class="nf">test_initial_from_regexp</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+      <span class="k">def</span> <a name="run_test"><span class="nf">run_test</span></a><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="nb">input</span><span class="p">):</span>
+        <span class="n">found</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">initial_from_regexp</span><span class="p">(</span><span class="nb">input</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">assertEquals</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">found</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;#.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;#.*</span><span class="se">\\</span><span class="s">n&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;#.*?$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;#.*?</span><span class="se">\\</span><span class="s">n&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;^#.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;^</span><span class="se">\\</span><span class="s">s*#.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;</span><span class="se">\\</span><span class="s">s*#.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;##&quot;</span><span class="p">,</span> <span class="s">&quot;##.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;//&quot;</span><span class="p">,</span> <span class="s">&quot;//.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;</span><span class="se">\&quot;</span><span class="s">&quot;</span><span class="p">,</span> <span class="s">&quot;^</span><span class="se">\\</span><span class="s">s*</span><span class="se">\&quot;</span><span class="s">.*&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;;&quot;</span><span class="p">,</span> <span class="s">&quot;;.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;@&quot;</span><span class="p">,</span> <span class="s">&quot;^@.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;!&quot;</span><span class="p">,</span> <span class="s">&quot;^!.*$&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;%&quot;</span><span class="p">,</span> <span class="s">&quot;^%.*</span><span class="se">\\</span><span class="s">n&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span> <a name="test_double_initial"><span class="nf">test_double_initial</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+      <span class="k">def</span> <a name="run_test"><span class="nf">run_test</span></a><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="nb">input</span><span class="p">):</span>
+        <span class="n">found</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">marker_from_initial</span><span class="p">(</span><span class="nb">input</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">assertEquals</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">found</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;##&quot;</span><span class="p">,</span> <span class="s">&quot;#&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;///&quot;</span><span class="p">,</span> <span class="s">&quot;//&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#//&quot;</span><span class="p">,</span> <span class="s">&quot;#/&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span> <a name="test_strip_marker"><span class="nf">test_strip_marker</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+      <span class="k">def</span> <a name="run_test"><span class="nf">run_test</span></a><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">marker</span><span class="p">,</span> <span class="n">line</span><span class="p">):</span>
+        <span class="n">found</span> <span class="o">=</span> <span class="n">CommentBlock</span><span class="o">.</span><span class="n">strip_marker</span><span class="p">(</span><span class="n">marker</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">assertEquals</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">found</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;Foo&quot;</span><span class="p">,</span> <span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;#Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;Foo&quot;</span><span class="p">,</span> <span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;# Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot; Foo&quot;</span><span class="p">,</span> <span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;#  Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;#Foo&quot;</span><span class="p">,</span> <span class="bp">None</span><span class="p">,</span> <span class="s">&quot;#Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;## Foo&quot;</span><span class="p">,</span> <span class="s">&quot;#&quot;</span><span class="p">,</span> <span class="s">&quot;### Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;# Foo&quot;</span><span class="p">,</span> <span class="s">&quot;##&quot;</span><span class="p">,</span> <span class="s">&quot;### Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;Foo&quot;</span><span class="p">,</span> <span class="s">&quot;###&quot;</span><span class="p">,</span> <span class="s">&quot;### Foo&quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;## Foo&quot;</span><span class="p">,</span> <span class="s">&quot;###&quot;</span><span class="p">,</span> <span class="s">&quot;## Foo&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span> <a name="test_header_to_anchor_name"><span class="nf">test_header_to_anchor_name</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+      <span class="k">def</span> <a name="run_test"><span class="nf">run_test</span></a><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="nb">input</span><span class="p">):</span>
+        <span class="n">found</span> <span class="o">=</span> <span class="n">AutoAnchorProcessor</span><span class="o">.</span><span class="n">header_to_anchor_name</span><span class="p">(</span><span class="nb">input</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">assertEquals</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">found</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;Foo&quot;</span><span class="p">,</span> <span class="s">&quot;  Foo  &quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;FooBarBaz&quot;</span><span class="p">,</span> <span class="s">&quot;  Foo bar baz &quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;FooBar12&quot;</span><span class="p">,</span> <span class="s">&quot;  Foo bar 12 &quot;</span><span class="p">)</span>
+      <span class="n">run_test</span><span class="p">(</span><span class="s">&quot;FooBarBaz&quot;</span><span class="p">,</span> <span class="s">&quot;Foo.bar.baz!&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span> <a name="test_language_infos"><span class="nf">test_language_infos</span></a><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+      <span class="k">return</span>
+      <span class="k">for</span> <span class="n">lexer</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">list_pygment_lexers</span><span class="p">():</span>        
+        <span class="n">language</span> <span class="o">=</span> <span class="n">LanguageInfo</span><span class="o">.</span><span class="n">for_lexer</span><span class="p">(</span><span class="n">lexer</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">language</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+          <span class="k">continue</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">language</span><span class="o">.</span><span class="n">get_comment_regexes</span><span class="p">())</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+          <span class="k">continue</span>
+        <span class="k">if</span> <span class="n">language</span><span class="o">.</span><span class="n">initial</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+          <span class="k">print</span> <span class="n">lexer</span><span class="p">,</span> <span class="n">language</span><span class="o">.</span><span class="n">get_comment_regexes</span><span class="p">()</span>
+
+  <span class="c"># For crying out loud, why must this be so complicated?!?</span>
+  <span class="n">loader</span> <span class="o">=</span> <span class="n">unittest</span><span class="o">.</span><span class="n">TestLoader</span><span class="p">()</span>
+  <span class="n">suite</span> <span class="o">=</span> <span class="n">loader</span><span class="o">.</span><span class="n">loadTestsFromTestCase</span><span class="p">(</span><span class="n">HemingwayTest</span><span class="p">)</span>
+  <span class="n">unittest</span><span class="o">.</span><span class="n">TextTestRunner</span><span class="p">()</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">suite</span><span class="p">)</span>
+</pre></div>
+</div><a name="EntryPoint"><h2>Entry-point</h2>
+</a><p>The main entry-point uses this cheesy trick to decide whether to run the
+tests. You might imagine a situation where you actually wanted to run the
+script with four files called <code>please</code>, <code>run</code>, <code>the</code>, and <code>tests</code> and then
+this wouldn't do what you want -- but even if the hack wasn't there you
+wouldn't get the effect you'd want because no <code>--root</code> has been specified so
+the program would fail.</p><div class="codehilite"><div class="hll"><pre><span class="k">if</span> <span class="n">__name__</span> <span class="o">==</span> <span class="s">&#39;__main__&#39;</span><span class="p">:</span>
+  <span class="k">print</span> <span class="n">my_data</span>
+  <span class="k">if</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">==</span> <span class="p">[</span><span class="s">&#39;please&#39;</span><span class="p">,</span> <span class="s">&#39;run&#39;</span><span class="p">,</span> <span class="s">&#39;the&#39;</span><span class="p">,</span> <span class="s">&#39;tests&#39;</span><span class="p">]:</span>
+    <span class="n">please_run_the_tests</span><span class="p">()</span>
+  <span class="k">else</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+      </div>
+    </div>
+  </body>
+</html>
