@@ -11,6 +11,9 @@
 ## literate programming model as envisioned by Knuth but an attempt to get some
 ## of the benefits without requiring extensions to the source language.
 ##
+## This page is the output from running the tool on its own source code,
+## [hemingway.py](https://github.com/goto-10/hemingway/blob/master/hemingway/main.py).
+##
 ## ## Installation
 ##
 ## To install hemingway in a linux-like environment do
