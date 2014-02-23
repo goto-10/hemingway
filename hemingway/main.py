@@ -158,16 +158,16 @@ class CrossRefPattern(markdown.inlinepatterns.Pattern):
       destination = ""
     else:
       destination = self.context.resolve_cross_reference(filename)
-    if not anchor is None:
-      destination += anchor
-    if not destination is None:
+    if destination is None:
+      element = markdown.util.etree.Element('em')
+      element.text = title
+      return element
+    else:
+      if not anchor is None:
+        destination += anchor
       element = markdown.util.etree.Element('a')
       element.text = title
       element.set("href", destination)
-      return element
-    else:
-      element = markdown.util.etree.Element('em')
-      element.text = title
       return element
 
 
@@ -428,7 +428,6 @@ class Converter(object):
 
   # Converts the text of a source file, returning the result as a string.
   def convert_source(self, source):
-    self.current_source = source
     contents = source.read()
     language = source.get_language()
     lines = contents.splitlines()
@@ -903,6 +902,7 @@ class Hemingway(object):
   # Converts a source file, writing the results into the output file.
   def convert_file(self, source):
     logging.info("Processing %s", source)
+    self.current_source = source
     markdown = self.converter.convert_source(source)
     output_file = source.get_absolute_output_path(self.options.out)
     self.ensure_parent_folder(output_file)
@@ -910,6 +910,7 @@ class Hemingway(object):
     try:
       port.write(markdown)
     finally:
+      self.current_source = None
       port.close()
 
   # Given a file, ensures that its parent folder has been created.
