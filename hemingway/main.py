@@ -11,6 +11,16 @@
 ## literate programming model as envisioned by Knuth but an attempt to get some
 ## of the benefits without requiring extensions to the source language.
 ##
+## ## Installation
+##
+## To install hemingway in a linux-like environment do
+##
+##     git clone https://github.com/goto-10/hemingway.git
+##     cd hemingway
+##     sudo python setup.py install
+##
+## This will fetch the dependencies and make the `hemingway` command available.
+##
 ## ## Basic usage
 ##
 ## Hemingway is intended to be run on a collection of files located under the
