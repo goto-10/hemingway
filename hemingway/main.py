@@ -16,13 +16,17 @@
 ## Hemingway is intended to be run on a collection of files located under the
 ## same root directory. You specify the argument like so,
 ##
-##     hemingway.py --root path/to/src "**/*.c" "**/*.h"
+##     hemingway --root path/to/src "**/*.c" "**/*.h"
 ##
 ## What this means is: starting from `path/to/src`, find all files that match
 ## the globs `**/*.c` and `**/*.h` relative to that root and convert them. The
 ## output will be stored in a subdirectory, `doc/` by default, also using paths
 ## relative to the root. So `path/to/src/foo/bar/baz.c` will be converted to
-## `doc/foo/bar/baz.c.html`.
+## `doc/foo/bar/baz.c.html`. See
+##
+##     hemingway --help
+##
+## for an overview of all the options supported by the tool.
 ##
 ## ## Watchdog
 ##
@@ -56,6 +60,7 @@
 
 import argparse
 import glob
+import logging
 import os.path
 import Queue
 import re
@@ -628,9 +633,6 @@ class CodeBlock(object):
 _LANGUAGE_OVERRIDES = {
   "C": {
     "comments": [r"//.*$"]
-  },
-  "Python": {
-    "ignore": r"#-.*$"
   }
 }
 
@@ -720,14 +722,16 @@ class LanguageInfo(object):
         action = matcher[1]
         if action in pygments.token.Comment:
           comments.append(matcher[0])
-    if marker is None:
+    if (marker is None) or (ignore is None):
       # If the initial hasn't been set explicitly try to infer it from the
       # comments.
       for comment in comments:
         initial = LanguageInfo.initial_from_regexp(comment)
         if not initial is None:
-          marker = LanguageInfo.marker_from_initial(initial)
-          break
+          if marker is None:
+            marker = LanguageInfo.marker_from_initial(initial)
+          if ignore is None:
+            ignore = LanguageInfo.ignore_from_initial(initial)
     result = LanguageInfo(lexer, marker, ignore)
     if not name is None:
       LanguageInfo.cache[name] = result
@@ -780,6 +784,12 @@ class LanguageInfo(object):
   def marker_from_initial(initial):
     return initial + initial[-1]
 
+  # Given an end-of-line comment initial returns an ignore marker. Just adds a
+  # minus at the end.
+  @staticmethod
+  def ignore_from_initial(initial):
+    return initial + "-"
+
 
 # This is just the regexp used above split into separate parts to make it
 # easier to read.
@@ -798,14 +808,23 @@ _INITIAL_REGEXP = re.compile(_COMMENT_PREFIX + _INITIAL_CHARS + _COMMENT_SUFFIX)
 
 class Hemingway(object):
 
+  LOG_FORMAT = "%(levelname)s: %(message)s"
+
   def __init__(self, args):
     parser = self.build_option_parser()
     self.options = parser.parse_args(args)
+    self.initialize_logging()
     self.validate_options()
     self.index = SourceIndex(self.options.root, self.options.pattern)
     self.current_source = None
     self.scheduler = Scheduler(self)
     self.converter = Converter(self)
+
+  # Configure logging appropriately.
+  def initialize_logging(self):
+    loglevel = self.options.log
+    level_value = getattr(logging, loglevel.upper())
+    logging.basicConfig(format=Hemingway.LOG_FORMAT, level=level_value)
 
   # Main entry-point for actually performing the conversion.
   def run(self):
@@ -837,6 +856,7 @@ class Hemingway(object):
     try:
       self.scheduler.start()
       if self.options.watchdog:
+        logging.info("Watching for file changes under %s", self.options.root)
         self.run_watchdog()
     finally:
       self.scheduler.finish_up()
@@ -882,7 +902,7 @@ class Hemingway(object):
 
   # Converts a source file, writing the results into the output file.
   def convert_file(self, source):
-    print "Converting %s" % source
+    logging.info("Processing %s", source)
     markdown = self.converter.convert_source(source)
     output_file = source.get_absolute_output_path(self.options.out)
     self.ensure_parent_folder(output_file)
@@ -911,6 +931,7 @@ class Hemingway(object):
     self.copy_asset(code, os.path.join(asset_path, "code.css"))
 
   def copy_asset(self, source, target):
+    logging.info("Creating asset %s", target)
     port = open(target, "wt")
     try:
       port.write(source)
@@ -950,6 +971,7 @@ class Hemingway(object):
       help="If set, inserts a refresh meta-tag in the output html.")
     parser.add_argument('--pygments-style', default="default", dest="pygments_style",
       help="Which formatter style to use for the generated output")
+    parser.add_argument('--log', default='INFO', help="Log level to use.")
     parser.add_argument('pattern', nargs='+',
       help="Globs (for instance '**/*.c') used to locate files under the root")
     return parser
@@ -968,7 +990,7 @@ def main():
   try:
     main.run()
   except KeyboardInterrupt, ki:
-    print "Interrupted; exiting."
+    logging.info("Interrupted; exiting.")
     sys.exit(1)
 
 

@@ -1,3 +1,10 @@
+This license applies to all parts of hemingway that are not externally
+maintained. The externally maintained parts are:
+
+  - The default markdown assets under hemingway/assets. These are taken from
+    https://github.com/jashkenas/docco which is copyrighted by Jeremy Ashkenas
+    and released under an MIT license.
+
 Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
