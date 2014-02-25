@@ -66,6 +66,8 @@
 ##     each part appropriately.
 ##   - The file handling (open, closing, watching) is done by the {{#Main}}(main)
 ##     class.
+##   - The {{lnb.py}}(diagram processor) analyzes ascii diagrams and produces
+##     corresponding images.
 ##
 ## The {{#UnitTests}}(please_run_the_tests) function runs the unit
 ## tests.
@@ -74,6 +76,7 @@
 import argparse
 import glob
 import logging
+import lnb
 import os.path
 import Queue
 import re
@@ -1100,8 +1103,10 @@ def please_run_the_tests():
           print lexer, language.get_comment_regexes()
 
   # For crying out loud, why must this be so complicated?!?
+  suite = unittest.TestSuite()
   loader = unittest.TestLoader()
-  suite = loader.loadTestsFromTestCase(HemingwayTest)
+  suite.addTests(loader.loadTestsFromTestCase(HemingwayTest))
+  suite.addTests(loader.loadTestsFromTestCase(lnb.get_unit_test_suite()))
   unittest.TextTestRunner().run(suite)
 
 
@@ -1115,7 +1120,6 @@ def please_run_the_tests():
 ## the program would fail.
 
 if __name__ == '__main__':
-  print my_data
   if sys.argv[1:] == ['please', 'run', 'the', 'tests']:
     please_run_the_tests()
   else:
