@@ -119,6 +119,7 @@ _HTML_TEMPLATE = """\
     %(header)s
     <link rel="stylesheet" href="%(assets)s/markdown.css" type="text/css" />
     <link rel="stylesheet" href="%(assets)s/code.css" type="text/css" />
+    <link rel="stylesheet" href="%(assets)s/diagram.css" type="text/css" />
   </head>
   <body>
     <div class="container">
@@ -505,6 +506,8 @@ class Converter(object):
         continue
       if language.is_comment(line):
         NextType = CommentBlock
+      elif language.is_diagram(line):
+        NextType = DiagramBlock
       else:
         NextType = CodeBlock
       if NextType != CurrentType:
@@ -637,6 +640,88 @@ class CodeBlock(object):
     return "<div class=\"codehilite\">%s</div>" % highlighted
 
 
+_DIAGRAM_TEMPLATE = """
+  <div class="lnb">
+    <svg width="%(width)s" height="%(height)s" class="diagram">
+      %(elements)s
+    </svg>
+  </div>
+"""
+
+
+_BOX_TEMPLATE = """
+<rect x="%(x)s" y="%(y)s" width="%(width)s" height="%(height)s" class="box"></rect>
+<foreignObject x="%(x)s" y="%(y)s" width="%(width)s" height="%(height)s" position="static">
+  <div xmlns="http://www.w3.org/1999/xhtml" class="boxbody">%(contents)s</div>
+</foreignObject>
+
+"""
+
+
+class DiagramBlock(object):
+
+  # A factor to multiply onto all coordinates to make shapes that look square
+  # in text form correspond to square(-ish) shapes in SVG. This is a square
+  # shape:
+  #
+  #   +---+
+  #   |   |
+  #   +---+
+  VERT_PER_HORZ = 3.0 / 5.0
+
+  def __init__(self, lines, language):
+    self.lines = lines
+
+  def is_empty(self):
+    return len("".join(self.lines).strip()) == 0
+
+  # Pad the lines with spaces all the way round.
+  def get_padded_lines(self):
+    max_len = max(map(len, self.lines))
+    padding = " " * (max_len + 2)
+    return [padding] + [" %s " % s for s in self.lines] + [padding]
+
+  def to_html(self, context):
+    padded_lines = self.get_padded_lines()
+    processor = lnb.DiagramProcessor(padded_lines)
+    diagram = processor.get_diagram()
+    elements = []
+    width = 0
+    height = 0
+    for shape in diagram.get_shapes():
+      bounds = shape.get_bounds()
+      width = max(width, bounds.bottom_right.x)
+      height = max(height, bounds.bottom_right.y)
+      if shape.get_type() == lnb.Shape.BOX:
+        elements.append(self.box_to_svg(shape))
+      elif shape.get_type() == lnb.Shape.TABLE:
+        elements.append(self.table_to_svg(shape))
+    return _DIAGRAM_TEMPLATE % {
+      "elements": "\n".join(elements),
+      "width": self.to_x(width + 1),
+      "height": self.to_y(height + 1)
+    }
+
+  def to_y(self, v):
+    return "%sem" % v
+
+  def to_x(self, v):
+    return "%sem" % (v * DiagramBlock.VERT_PER_HORZ)
+
+  def box_to_svg(self, box):
+    bounds = box.get_bounds()
+    return _BOX_TEMPLATE % {
+      "x": self.to_x(bounds.get_top_left().get_x()),
+      "y": self.to_y(bounds.get_top_left().get_y()),
+      "width": self.to_x(bounds.get_width()),
+      "height": self.to_y(bounds.get_height()),
+      "contents": ""
+    }
+
+  def table_to_svg(self, table):
+    return self.box_to_svg(table.get_boundary())
+
+
 ## ## Language Processing
 ##
 ## The language specific processing is all done by the `LanguageInfo` class.
@@ -654,13 +739,15 @@ _LANGUAGE_OVERRIDES = {
 # Collection of information needed to process a file in a particular language.
 class LanguageInfo(object):
 
-  def __init__(self, lexer, marker, ignore):
+  def __init__(self, lexer, marker, ignore, diagram):
     self.lexer = lexer
     self.marker = marker
+    self.diagram = diagram
     if ignore is None:
       self.ignore = None
     else:
       self.ignore = re.compile(ignore)
+
 
   # Returns the pygments lexer to use for this language.
   def get_lexer(self):
@@ -674,6 +761,10 @@ class LanguageInfo(object):
   def is_comment(self, line):
     stripped = line.strip()
     return stripped.startswith(self.marker)
+
+  def is_diagram(self, line):
+    stripped = line.strip()
+    return stripped.startswith(self.diagram)
 
   def is_ignored(self, line):
     if self.ignore is None:
@@ -707,6 +798,7 @@ class LanguageInfo(object):
     comments = None
     overrides = None
     ignore = None
+    diagram = None
     # Grab the name if possible.
     if hasattr(lexer, 'name'):
       name = lexer.name
@@ -725,6 +817,7 @@ class LanguageInfo(object):
       comments = overrides.get("comments", None)
       marker = overrides.get("marker", None)
       ignore = overrides.get("ignore", None)
+      diagram = overrides.get("diagram", None)
     if comments is None:
       # If comments haven't been set explicitly and the lexer doesn't have
       # tokens (that we can see) we have to give up.
@@ -747,7 +840,9 @@ class LanguageInfo(object):
             marker = LanguageInfo.marker_from_initial(initial)
           if ignore is None:
             ignore = LanguageInfo.ignore_from_initial(initial)
-    result = LanguageInfo(lexer, marker, ignore)
+          if diagram is None:
+            diagram = LanguageInfo.diagram_from_initial(initial)
+    result = LanguageInfo(lexer, marker, ignore, diagram)
     if not name is None:
       LanguageInfo.cache[name] = result
     return result
@@ -804,6 +899,11 @@ class LanguageInfo(object):
   @staticmethod
   def ignore_from_initial(initial):
     return initial + "-"
+
+  # Given an end-of-line comment initial returns a diagram marker.
+  @staticmethod
+  def diagram_from_initial(initial):
+    return initial + "%"
 
 
 # This is just the regexp used above split into separate parts to make it
@@ -942,6 +1042,8 @@ class Hemingway(object):
       os.makedirs(asset_path)
     markdown = pkg_resources.resource_string(__name__, "assets/markdown-default.css")
     self.copy_asset(markdown, os.path.join(asset_path, "markdown.css"))
+    diagram = pkg_resources.resource_string(__name__, "assets/diagram-default.css")
+    self.copy_asset(diagram, os.path.join(asset_path, "diagram.css"))
     # Pygments comes with some style sheets so just copy one of those.
     formatter = pygments.formatters.HtmlFormatter(style=self.options.pygments_style)
     code = formatter.get_style_defs('.codehilite')

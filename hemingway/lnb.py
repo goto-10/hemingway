@@ -6,18 +6,32 @@
 ##
 ## Lines And Boxes converts ascii diagrams such as
 ##
-##     +---+  +---+
-##     |   |  |   |
-##     +---+  +---+
+##                   /------\           
+##       +-------+   |      |           
+##       |       |   | +--+ |   +--+--+ 
+##       +-------+   | |  | |   |  |  | 
+##                   | +--+ |   +--+--+ 
+##                   |      |   |  |  | 
+##          +---+    \------/   |  |  | 
+##          |   |               +--+--+ 
+##          +---+                       
 ##
 ## to SVG diagrams, in this case for instance
 ##
-#%     +---+  +---+
-#%     |   |  |   |
-#%     +---+  +---+
+#%                   /------\           
+#%       +-------+   |      |           
+#%       |       |   | +--+ |   +--+--+ 
+#%       +-------+   | |  | |   |  |  | 
+#%                   | +--+ |   +--+--+ 
+#%                   |      |   |  |  | 
+#%          +---+    \------/   |  |  | 
+#%          |   |               +--+--+ 
+#%          +---+                       
 ##
 ## # Implementation
-##
+
+import sys
+
 ## The diagram converts ascii diagrams to images. It uses a graph-based approach
 ## where each diagram character used in a piece of text, like `/`, `-`, or `|`,
 ## are converted to nodes in a directed graph that connect to some number of
@@ -40,7 +54,6 @@
 ## corresponding to each character is given in the map below where `*` indicates
 ## a bi-directional half edge and `<`, `>`, `^`, and `v` are one directional
 ## half edges in the obvious direction.
-
 
 _DIAGRAM_NODE_SHAPES = {
   "-":  ("   "
@@ -178,7 +191,6 @@ class Node(object):
 ##
 ## 
 
-
 class DiagramProcessor(object):
 
   def __init__(self, lines):
@@ -187,7 +199,7 @@ class DiagramProcessor(object):
     self.full_nodes = None
     self.space_colors = None
     self.shapes = None
-    self.process()
+    self.diagram = None
 
   # Processes the diagram lines.
   def process(self):
@@ -195,8 +207,16 @@ class DiagramProcessor(object):
     self.full_nodes = self.get_full_nodes()
     self.identify_connected_components()
     self.space_colors = self.flood_fill_spaces()
+    self.regions = self.build_regions()
     self.mark_monochrome_nodes()
+    self.diagram = Diagram(self)
     self.shapes = self.extract_shapes()
+
+  # Returns the analyzed diagram object.
+  def get_diagram(self):
+    if self.diagram is None:
+      self.process()
+    return self.diagram
 
   # Given a list of string lines that make up an ascii diagram returns an array
   # of arrays with the corresponding half nodes for each character.
@@ -459,6 +479,20 @@ class DiagramProcessor(object):
             colors_seen.add(color)
       node.is_monochrome = (len(colors_seen) == 1)
 
+  ## ### Building regions
+  ##
+  ## Using the space colors, builds a map from colors to the set of points that
+  ## were given that color. This will be useful later, for instance when
+  ## identifying shapes like tables.
+  def build_regions(self):
+    regions = {}
+    for (point, color) in self.space_colors.items():
+      if not color in regions:
+        regions[color] = []
+      regions[color].append(point)
+    return dict([(c, Region(c, p)) for (c, p) in regions.items()])
+    
+
   ## ### Extracting the diagram shapes
   ##
   ## Based on the now thoroughly annotated graph, extracts the graph's shapes by
@@ -481,7 +515,8 @@ class DiagramProcessor(object):
         if candidate.is_monochrome or candidate.get_component() != component:
           continue
         nodes.append(candidate)
-      shape = EnclosingShape.create(nodes)
+      proto_shape = UnknownShape(self, nodes)
+      shape = EnclosingShape.create(self, proto_shape)
       enclosing[component] = shape
       shapes.append(shape)
     return shapes
@@ -513,88 +548,286 @@ class DiagramProcessor(object):
     return self.shapes
 
 
+# A region within (or around) some walls.
+class Region(object):
+
+  def __init__(self, color, points):
+    self.color = color
+    self.points = points
+    self.bounds_cache = None
+
+  # Returns the tightest rectangle enclosing all the points in this region.
+  def get_bounds(self):
+    if self.bounds_cache is None:
+      self.bounds_cache = Rect.get_bounds_from_points(self.points)
+    return self.bounds_cache
+
+  # Returns true if this region is a square.
+  def is_square(self):
+    return self.get_bounds().is_square_within(self.points, False)
+
+  def __str__(self):
+    return "region(%s)" % self.get_bounds()
+
+
 # Abstract superclass of diagram shapes.
-class DiagramShape(object):
-  pass
+class Shape(object):
+  
+  BOX = 'box'
+  IRREGULAR = 'irregular'
+  TABLE = 'table'
+
+  def __init__(self, origin, nodes):
+    self.origin = origin
+    self.nodes = nodes
+    self.bounds_cache = None
+    self.walls_cache = None
+
+  # Returns a string that identifies the type of this shape.
+  def get_type(self):
+    return None
+
+  # Returns a bounding rectangle that fully contains this shape.
+  def get_bounds(self):
+    if self.bounds_cache is None:
+      self.bounds_cache = Rect.get_bounds_from_points([(n.x, n.y) for n in self.nodes])
+    return self.bounds_cache
+
+  # Returns a WallMap that describes the walls of this shape.
+  def get_walls(self):
+    if self.walls_cache is None:
+      self.walls_cache = WallMap(set([(n.x, n.y) for n in self.nodes]))
+    return self.walls_cache
+
+  # Returns an array of this shape's nodes.
+  def get_nodes(self):
+    return self.nodes
 
 
 # A shape that encloses a region, for instance a box.
-class EnclosingShape(DiagramShape):
-  
-  def __init__(self, nodes):
-    self.nodes = nodes
+class EnclosingShape(Shape):
   
   @staticmethod
-  def create(nodes):
-    as_box = BoxShape.try_create(nodes)
+  def create(origin, proto):
+    as_box = BoxShape.try_create(origin, proto, False)
     if not as_box is None:
       return as_box
-    else:
-      return EnclosingShape(nodes)
+    as_table = TableShape.try_create(origin, proto)
+    if not as_table is None:
+      return as_table
+    return IrregularShape(origin, proto.get_nodes())
 
 
-class BoxShape(DiagramShape):
+# A simple square box.
+class BoxShape(EnclosingShape):
 
-  def __init__(self, nodes, x, y, width, height):
-    self.nodes = nodes
-    self.x = x
-    self.y = y
-    self.width = width
-    self.height = height
+  def __init__(self, origin, nodes, bounds):
+    super(BoxShape, self).__init__(origin, nodes)
+    self.bounds = bounds
+
+  def get_type(self):
+    return Shape.BOX
+
+  # Returns a rect that describes the bounds of this box.
+  def get_bounds(self):
+    return self.bounds
 
   # Attempts to create a box shape from the given nodes. If the nodes are not
   # a box None will be returned.
   @staticmethod
-  def try_create(nodes):
-    if len(nodes) < 4:
+  def try_create(origin, proto, allow_internal):
+    bounds = proto.get_bounds()
+    walls = proto.get_walls()
+    width = bounds.get_width() - 1
+    height = bounds.get_height() - 1
+    top_left = bounds.get_top_left()
+    # Scan through all the points within the bounds of the shape and check that
+    # they form a box.
+    for x in range(0, width + 1):
+      for y in range(0, height + 1):
+        expect_wall = (x == 0) or (x == width) or (y == 0) or (y == height)
+        found_wall = walls.has_wall(top_left.x + x, top_left.y + y)
+        if expect_wall:
+          if not found_wall:
+            # If we expected a wall and there was none it's definitely not a
+            # box.
+            return None
+        else:
+          if (not allow_internal) and found_wall:
+            # If we didn't expect a wall that's okay if allow_internal is True.
+            # If it's not, however, we don't allow there to be walls were we
+            # don't expect them.
+            return None
+    return BoxShape(origin, proto.get_nodes(), bounds)
+
+
+class TableShape(Shape):
+
+  def __init__(self, origin, nodes, boundary, cells):
+    super(TableShape, self).__init__(origin, nodes)
+    self.boundary = boundary
+    self.cells = cells
+
+  def get_type(self):
+    return Shape.TABLE
+
+  def get_boundary(self):
+    return self.boundary
+
+  @staticmethod
+  def try_create(origin, proto):
+    # Is the shape completely enclosed within a box?
+    boundary = BoxShape.try_create(origin, proto, True)
+    if boundary is None:
       return None
-    # Because the nodes are sorted the 0'th will be the top left if this is a
-    # box.
-    top_left = nodes[0]
-    # Try to determine the height of the box by scanning down the left-hand side
-    # which, again because the nodes are sorted, will be the first nodes in the
-    # list.
-    height = 0
-    while True:
-      if height == len(nodes):
-        # If we've reached the end of the list before we've even found the
-        # height of the thing then it's definitely not a box.
+    # Are all the regions within the table rectangular?
+    regions = origin.get_diagram().get_regions()
+    cells = []
+    for region in regions:
+      if not proto.get_bounds().contains(region.get_bounds()):
+        continue
+      if region.is_square():
+        cells.append(region)
+      else:
         return None
-      if nodes[height].x != top_left.x:
-        # When x changes we're no longer scanning down the left edge.
-        break
-      height += 1
-    # Calculate the expected width of the box using the fact that a box of size
-    # W*H has a circumference of 2W + 2H - 4 nodes.
-    if (len(nodes) % 2 != 0):
-      return None
-    width = (len(nodes) / 2) + 2 - height
-    if width <= 0:
-      return None
-    # Okay now we know what the width and height should be if this is a box.
-    # Since we know what the nodes should look like for such a box we can simply
-    # scan through and verify that they look like we expect.
-    #
-    # First, scan the left and right edges at the same time.
-    for i in range(0, height):
-      left = nodes[i]
-      if (left.x != top_left.x) or (left.y != top_left.y + i):
-        return None
-      right = nodes[len(nodes) - height + i]
-      if (right.x != top_left.x + width - 1) or (right.y != top_left.y + i):
-        return None
-    # Scan the top and bottom edges, skipping the corners which we've already
-    # scanned above.
-    for i in range(1, width - 1):
-      top = nodes[height + 2 * i - 2]
-      if (top.y != top_left.y) or (top.x != top_left.x + i):
-        return None
-      bottom = nodes[height + 2 * i - 1]
-      if (bottom.y != top_left.y + height - 1) or (bottom.x != top_left.x + i):
-        return None
-    # If we made it all the way through then this shape is definitely a box.
-    # There was much rejoicing.
-    return BoxShape(nodes, top_left.x, top_left.y, width, height)
+    return TableShape(origin, proto.get_nodes(), boundary, cells)
+
+  # Returns the list of cells within this table.
+  def get_cells(self):
+    return self.cells
+
+
+# A shape that's not recognized as any other "nice" form.
+class IrregularShape(Shape):
+  pass
+
+
+# This type is used temporarily while determining which kind of shape a set of
+# nodes correspond to.
+class UnknownShape(Shape):
+  pass
+
+
+## ## Diagram
+##
+## The diagram type encapsulates a processed diagram.
+
+class Diagram(object):
+
+  def __init__(self, origin):
+    self.origin = origin
+    self.regions = None
+
+  def get_shapes(self):
+    assert not self.origin.shapes is None
+    return self.origin.shapes
+
+  def get_regions(self):
+    if not self.regions is None:
+      return self.regions
+    assert not self.origin.regions is None
+    self.regions = []
+    for color in sorted(self.origin.regions.keys()):
+      self.regions.append(self.origin.regions[color])
+    return self.regions
+
+
+class Rect(object):
+
+  def __init__(self, top_left, bottom_right):
+    self.top_left = top_left
+    self.bottom_right = bottom_right
+
+  def get_top_left(self):
+    return self.top_left
+
+  def get_bottom_right(self):
+    return self.bottom_right
+
+  def get_width(self):
+    return self.bottom_right.get_x() - self.top_left.get_x()
+
+  def get_height(self):
+    return self.bottom_right.get_y() - self.top_left.get_y()
+
+  # Returns True iff this rectangle completely contains the given rect.
+  def contains(self, that):
+    return (self.top_left.x <= that.top_left.x
+      and self.top_left.y <= that.top_left.y
+      and that.bottom_right.x <= self.bottom_right.x
+      and that.bottom_right.y <= self.bottom_right.y)
+
+  # Returns true the given set of points contains a square at the position of
+  # this rectangle.
+  def is_square_within(self, points, allow_internal):
+    width = self.get_width() - 1
+    height = self.get_height() - 1
+    top_left = self.get_top_left()
+    # Scan through all the points within the bounds of the shape and check that
+    # they form a box.
+    for x in range(0, width + 1):
+      for y in range(0, height + 1):
+        expect_wall = (x == 0) or (x == width) or (y == 0) or (y == height)
+        found_wall = (top_left.x + x, top_left.y + y) in points
+        if expect_wall:
+          if not found_wall:
+            # If we expected a wall and there was none it's definitely not a
+            # box.
+            return False
+        else:
+          if (not allow_internal) and found_wall:
+            # If we didn't expect a wall that's okay if allow_internal is True.
+            # If it's not, however, we don't allow there to be walls were we
+            # don't expect them.
+            return False
+    return True
+
+
+  @staticmethod
+  def get_bounds_from_points(points):
+    top_left_x = sys.maxint
+    top_left_y = sys.maxint
+    bottom_right_x = -sys.maxint
+    bottom_right_y = -sys.maxint
+    for (x, y) in points:
+      top_left_x = min(top_left_x, x)
+      top_left_y = min(top_left_y, y)
+      # Nodes are considered to have width 1 so we add 1 to get their 
+      # right/bottom bounds.
+      bottom_right_x = max(bottom_right_x, x)
+      bottom_right_y = max(bottom_right_y, y)
+    return Rect(Point(top_left_x, top_left_y),
+      Point(bottom_right_x + 1, bottom_right_y + 1))
+
+  def __str__(self):
+    return "r%s->%s" % (self.top_left, self.bottom_right)
+
+
+class Point(object):
+
+  def __init__(self, x, y):
+    self.x = x
+    self.y = y
+
+  def get_x(self):
+    return self.x
+
+  def get_y(self):
+    return self.y
+
+  def __str__(self):
+    return "(%s, %s)" % (self.x, self.y)
+
+
+# A bitmap that knows where the walls are in a shape.
+class WallMap(object):
+
+  def __init__(self, walls):
+    self.walls = walls
+
+  def has_wall(self, x, y):
+    return (x, y) in self.walls
+
 
 def get_unit_test_suite():
   import unittest
@@ -706,6 +939,7 @@ def get_unit_test_suite():
     def test_full_nodes(self):
       def run_test(expected, lines):
         processor = DiagramProcessor(lines)
+        processor.process()
         found = []
         for y in range(0, len(expected)):
           expected_row = expected[y]
@@ -878,6 +1112,7 @@ def get_unit_test_suite():
     def test_components(self):
       def run_test(expected, lines):
         processor = DiagramProcessor(lines)
+        processor.process()
         def get_component_char(diagram, x, y):
           node = diagram.get_full_node(x, y)
           if node is None:
@@ -955,6 +1190,7 @@ def get_unit_test_suite():
     # nodes and edges
     def make_test_graph(self, lines):
       result = DiagramProcessor([])
+      result.process()
       for x in range(0, 4):
         for y in range(0, 4):
           cy = y * 2
@@ -1244,6 +1480,7 @@ def get_unit_test_suite():
     def test_flood_fill_spaces(self):
       def run_test(expected, lines):
         diagram = DiagramProcessor(lines)
+        diagram.process()
         def get_color_char(diagram, x, y):
           color = diagram.get_space_color(x, y)
           if color is None:
@@ -1326,6 +1563,7 @@ def get_unit_test_suite():
     def test_monochrome_nodes(self):
       def run_test(expected, lines):
         diagram = DiagramProcessor(lines)
+        diagram.process()
         def get_monochrome_char(diagram, x, y):
           node = diagram.get_full_node(x, y)
           if node is None:
@@ -1390,17 +1628,39 @@ def get_unit_test_suite():
         " +--+   +--+ ",
         "             "
       ])
+      run_test([
+        "         ",
+        " ....... ",
+        " .  .  . ",
+        " ....... ",
+        "         "
+      ], [
+        "         ",
+        " +--+--+ ",
+        " |  |  | ",
+        " +--+--+ ",
+        "         "
+      ])
 
     def test_shapes(self):
       def box(x, y, w, h):
         return ("box", x, y, w, h)
+      def table(x, y, w, h, *cells):
+        return ("table", x, y, w, h, cells)
+      def flatten_rect(rect):
+        return (rect.top_left.x, rect.top_left.y, rect.get_width(), rect.get_height())
       def flatten_shape(shape):
         if isinstance(shape, BoxShape):
-          return box(shape.x, shape.y, shape.width, shape.height)
+          bounds = shape.get_bounds()
+          return box(*flatten_rect(bounds))
+        elif isinstance(shape, TableShape):
+          bounds = shape.get_bounds()
+          return table(*(list(flatten_rect(bounds)) + [flatten_rect(c.get_bounds()) for c in shape.get_cells()]))
         else:
           return None
       def run_test(expected, lines):
         diagram = DiagramProcessor(lines)
+        diagram.process()
         shapes = diagram.get_shapes()
         self.assertEquals(expected, map(flatten_shape, shapes))
 
@@ -1423,6 +1683,53 @@ def get_unit_test_suite():
         " |  | |  | ",
         " +--+ +--+ ",
         "           "
+      ])
+
+      run_test([
+        box(1, 2, 9, 3),
+        box(4, 6, 5, 3),
+        box(13, 1, 7, 6)
+      ], [
+        "                       ",
+        "             /-----+   ",
+        " +-------+   |     |   ",
+        " |       |   |     |   ",
+        " +-------+   |     |   ",
+        "             |     |   ",
+        "    +---+    +-----/   ",
+        "    |   |              ",
+        "    +---+              ",
+        "                       "
+      ])
+
+      run_test([
+        table(1, 1, 7, 5,
+          (2, 2, 5, 1),
+          (2, 4, 5, 1)),
+      ], [
+        "         ",
+        " +-----+ ",
+        " |     | ",
+        " +-----+ ",
+        " |     | ",
+        " +-----+ ",
+        "         ",
+      ])
+
+      run_test([
+        table(1, 1, 7, 5,
+          (2, 2, 2, 1),
+          (2, 4, 2, 1),
+          (5, 2, 2, 1),
+          (5, 4, 2, 1))
+      ], [
+        "         ",
+        " +--+--+ ",
+        " |  |  | ",
+        " +--+--+ ",
+        " |  |  | ",
+        " +--+--+ ",
+        "         ",
       ])
 
   return LinesAndBoxesTest

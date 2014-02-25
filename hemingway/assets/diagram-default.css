@@ -1,0 +1,21 @@
+.lnb .diagram {
+  margin: 10px;
+  font-size: 12pt;
+  line-height: 1;
+  font-family: sans-serif;
+}
+
+.lnb .box {
+  fill: white;
+  stroke: black;
+  stroke-width: 1px;
+}
+
+.lnb .boxbody {
+  padding-left: 2px;
+  padding-right: 2px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  overflow: hidden;
+  font-size: 10pt;
+}
