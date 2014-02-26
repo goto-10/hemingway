@@ -30,6 +30,7 @@
 ##
 ## # Implementation
 
+import dom
 import sys
 
 ## The diagram converts ascii diagrams to images. It uses a graph-based approach
@@ -54,46 +55,6 @@ import sys
 ## corresponding to each character is given in the map below where `*` indicates
 ## a bi-directional half edge and `<`, `>`, `^`, and `v` are one directional
 ## half edges in the obvious direction.
-
-_DIAGRAM_NODE_SHAPES = {
-  "-":  ("   "
-         "***"
-         "   "),
-
-  "|":  (" * "
-         " * "
-         " * "),
-
-  "+":  (" * "
-         "***"
-         " * "),
-
-  "/":  (" v*"
-         "<*>"
-         "*^ "),
-
-  "\\": ("*^ "
-         ">*<"
-         " v*"),
-
-  "v":  ("vvv"
-         "   "
-         "   "),
-
-  "^":  ("   "
-         "   "
-         "^^^"),
-
-  "<":  ("  <"
-         "  <"
-         "  <"),
-
-  ">":  (">  "
-         ">  "
-         ">  ")
-
-}
-
 
 class HalfGraphNode(object):
 
@@ -143,18 +104,87 @@ class HalfGraphNode(object):
       return (x, y) in self.ins
     else:
       return (x, y) in self.outs
-    
-
-# Wrap the shapes in singleton half nodes.
-_DIAGRAM_HALF_NODES = dict([
-  (char, HalfGraphNode(shape)) for (char, shape) in _DIAGRAM_NODE_SHAPES.items()])
 
 
-# Half graph node with no edges.
-_EMPTY_NODE = HalfGraphNode(
-  "   "
-  "   "
-  "   ")
+## ## Diagram character registry.
+##
+## This registry keeps track of how the various diagram characters like `-` and
+## `/` connect to each other.
+
+
+class DiagramCharacterRegistry(object):
+
+  # Half graph node with no edges.
+  EMPTY_HALF_NODE = HalfGraphNode(
+    "   "
+    "   "
+    "   "
+  )
+
+  def __init__(self):
+    self.chars = {}
+
+  def add_char(self, char, connectivity):
+    self.chars[char] = HalfGraphNode("".join(connectivity))
+    return self
+
+  def get_half_node(self, char):
+    return self.chars.get(char, DiagramCharacterRegistry.EMPTY_HALF_NODE)
+
+  @staticmethod
+  def get_default():
+    return _DEFAULT_DIAGRAM_CHARACTER_REGISTRY
+
+
+# The default characters.
+_DEFAULT_DIAGRAM_CHARACTER_REGISTRY = (
+  DiagramCharacterRegistry()
+    .add_char("-", [
+      "   ",
+      "***",
+      "   ",
+    ])
+    .add_char("|", [
+      " * ",
+      " * ",
+      " * ",
+    ])
+    .add_char("+", [
+      " * ",
+      "***",
+      " * ",
+    ])
+    .add_char("/", [
+      " v*",
+      "<*>",
+      "*^ ",
+    ])
+    .add_char("\\", [
+      "*^ ",
+      ">*<",
+      " v*",
+    ])
+    .add_char("v", [
+      "vvv",
+      "   ",
+      "   ",
+    ])
+    .add_char("^", [
+      "   ",
+      "   ",
+      "^^^",
+    ])
+    .add_char("<", [
+      "  <",
+      "  <",
+      "  <",
+    ])
+    .add_char(">", [
+      ">  ",
+      ">  ",
+      ">  ",
+    ])
+  )
 
 
 ## ### Full nodes
@@ -200,6 +230,8 @@ class DiagramProcessor(object):
     self.space_colors = None
     self.shapes = None
     self.diagram = None
+    self.shape_registry = dom.ShapeRegistry().get_default()
+    self.chars = DiagramCharacterRegistry.get_default()
 
   # Processes the diagram lines.
   def process(self):
@@ -209,7 +241,7 @@ class DiagramProcessor(object):
     self.space_colors = self.flood_fill_spaces()
     self.regions = self.build_regions()
     self.mark_monochrome_nodes()
-    self.diagram = Diagram(self)
+    self.diagram = dom.Diagram(self)
     self.shapes = self.extract_shapes()
 
   # Returns the analyzed diagram object.
@@ -222,7 +254,7 @@ class DiagramProcessor(object):
   # of arrays with the corresponding half nodes for each character.
   def get_half_nodes(self):
     def to_half_node(char):
-      return _DIAGRAM_HALF_NODES.get(char, _EMPTY_NODE)
+      return self.chars.get_half_node(char)
     def line_to_half_nodes(line):
       return [to_half_node(char) for char in line]
     return map(line_to_half_nodes, self.lines)
@@ -490,7 +522,7 @@ class DiagramProcessor(object):
       if not color in regions:
         regions[color] = []
       regions[color].append(point)
-    return dict([(c, Region(c, p)) for (c, p) in regions.items()])
+    return dict([(c, dom.Region(c, p)) for (c, p) in regions.items()])
     
 
   ## ### Extracting the diagram shapes
@@ -515,8 +547,8 @@ class DiagramProcessor(object):
         if candidate.is_monochrome or candidate.get_component() != component:
           continue
         nodes.append(candidate)
-      proto_shape = UnknownShape(self, nodes)
-      shape = EnclosingShape.create(self, proto_shape)
+      proto_shape = dom.UnknownShape(self, nodes)
+      shape = self.shape_registry.resolve(self, proto_shape)
       enclosing[component] = shape
       shapes.append(shape)
     return shapes
@@ -536,7 +568,7 @@ class DiagramProcessor(object):
       row = self.half_nodes[y]
       if 0 <= x and x < len(row):
         return row[x]
-    return _EMPTY_NODE
+    return DiagramCharacterRegistry.EMPTY_HALF_NODE
 
   # Returns the full node at (x, y). If there is no full node None will be
   # returned.
@@ -546,287 +578,6 @@ class DiagramProcessor(object):
   # Returns the shapes identified in this diagram.
   def get_shapes(self):
     return self.shapes
-
-
-# A region within (or around) some walls.
-class Region(object):
-
-  def __init__(self, color, points):
-    self.color = color
-    self.points = points
-    self.bounds_cache = None
-
-  # Returns the tightest rectangle enclosing all the points in this region.
-  def get_bounds(self):
-    if self.bounds_cache is None:
-      self.bounds_cache = Rect.get_bounds_from_points(self.points)
-    return self.bounds_cache
-
-  # Returns true if this region is a square.
-  def is_square(self):
-    return self.get_bounds().is_square_within(self.points, False)
-
-  def __str__(self):
-    return "region(%s)" % self.get_bounds()
-
-
-# Abstract superclass of diagram shapes.
-class Shape(object):
-  
-  BOX = 'box'
-  IRREGULAR = 'irregular'
-  TABLE = 'table'
-
-  def __init__(self, origin, nodes):
-    self.origin = origin
-    self.nodes = nodes
-    self.bounds_cache = None
-    self.walls_cache = None
-
-  # Returns a string that identifies the type of this shape.
-  def get_type(self):
-    return None
-
-  # Returns a bounding rectangle that fully contains this shape.
-  def get_bounds(self):
-    if self.bounds_cache is None:
-      self.bounds_cache = Rect.get_bounds_from_points([(n.x, n.y) for n in self.nodes])
-    return self.bounds_cache
-
-  # Returns a WallMap that describes the walls of this shape.
-  def get_walls(self):
-    if self.walls_cache is None:
-      self.walls_cache = WallMap(set([(n.x, n.y) for n in self.nodes]))
-    return self.walls_cache
-
-  # Returns an array of this shape's nodes.
-  def get_nodes(self):
-    return self.nodes
-
-
-# A shape that encloses a region, for instance a box.
-class EnclosingShape(Shape):
-  
-  @staticmethod
-  def create(origin, proto):
-    as_box = BoxShape.try_create(origin, proto, False)
-    if not as_box is None:
-      return as_box
-    as_table = TableShape.try_create(origin, proto)
-    if not as_table is None:
-      return as_table
-    return IrregularShape(origin, proto.get_nodes())
-
-
-# A simple square box.
-class BoxShape(EnclosingShape):
-
-  def __init__(self, origin, nodes, bounds):
-    super(BoxShape, self).__init__(origin, nodes)
-    self.bounds = bounds
-
-  def get_type(self):
-    return Shape.BOX
-
-  # Returns a rect that describes the bounds of this box.
-  def get_bounds(self):
-    return self.bounds
-
-  # Attempts to create a box shape from the given nodes. If the nodes are not
-  # a box None will be returned.
-  @staticmethod
-  def try_create(origin, proto, allow_internal):
-    bounds = proto.get_bounds()
-    walls = proto.get_walls()
-    width = bounds.get_width() - 1
-    height = bounds.get_height() - 1
-    top_left = bounds.get_top_left()
-    # Scan through all the points within the bounds of the shape and check that
-    # they form a box.
-    for x in range(0, width + 1):
-      for y in range(0, height + 1):
-        expect_wall = (x == 0) or (x == width) or (y == 0) or (y == height)
-        found_wall = walls.has_wall(top_left.x + x, top_left.y + y)
-        if expect_wall:
-          if not found_wall:
-            # If we expected a wall and there was none it's definitely not a
-            # box.
-            return None
-        else:
-          if (not allow_internal) and found_wall:
-            # If we didn't expect a wall that's okay if allow_internal is True.
-            # If it's not, however, we don't allow there to be walls were we
-            # don't expect them.
-            return None
-    return BoxShape(origin, proto.get_nodes(), bounds)
-
-
-class TableShape(Shape):
-
-  def __init__(self, origin, nodes, boundary, cells):
-    super(TableShape, self).__init__(origin, nodes)
-    self.boundary = boundary
-    self.cells = cells
-
-  def get_type(self):
-    return Shape.TABLE
-
-  def get_boundary(self):
-    return self.boundary
-
-  @staticmethod
-  def try_create(origin, proto):
-    # Is the shape completely enclosed within a box?
-    boundary = BoxShape.try_create(origin, proto, True)
-    if boundary is None:
-      return None
-    # Are all the regions within the table rectangular?
-    regions = origin.get_diagram().get_regions()
-    cells = []
-    for region in regions:
-      if not proto.get_bounds().contains(region.get_bounds()):
-        continue
-      if region.is_square():
-        cells.append(region)
-      else:
-        return None
-    return TableShape(origin, proto.get_nodes(), boundary, cells)
-
-  # Returns the list of cells within this table.
-  def get_cells(self):
-    return self.cells
-
-
-# A shape that's not recognized as any other "nice" form.
-class IrregularShape(Shape):
-  pass
-
-
-# This type is used temporarily while determining which kind of shape a set of
-# nodes correspond to.
-class UnknownShape(Shape):
-  pass
-
-
-## ## Diagram
-##
-## The diagram type encapsulates a processed diagram.
-
-class Diagram(object):
-
-  def __init__(self, origin):
-    self.origin = origin
-    self.regions = None
-
-  def get_shapes(self):
-    assert not self.origin.shapes is None
-    return self.origin.shapes
-
-  def get_regions(self):
-    if not self.regions is None:
-      return self.regions
-    assert not self.origin.regions is None
-    self.regions = []
-    for color in sorted(self.origin.regions.keys()):
-      self.regions.append(self.origin.regions[color])
-    return self.regions
-
-
-class Rect(object):
-
-  def __init__(self, top_left, bottom_right):
-    self.top_left = top_left
-    self.bottom_right = bottom_right
-
-  def get_top_left(self):
-    return self.top_left
-
-  def get_bottom_right(self):
-    return self.bottom_right
-
-  def get_width(self):
-    return self.bottom_right.get_x() - self.top_left.get_x()
-
-  def get_height(self):
-    return self.bottom_right.get_y() - self.top_left.get_y()
-
-  # Returns True iff this rectangle completely contains the given rect.
-  def contains(self, that):
-    return (self.top_left.x <= that.top_left.x
-      and self.top_left.y <= that.top_left.y
-      and that.bottom_right.x <= self.bottom_right.x
-      and that.bottom_right.y <= self.bottom_right.y)
-
-  # Returns true the given set of points contains a square at the position of
-  # this rectangle.
-  def is_square_within(self, points, allow_internal):
-    width = self.get_width() - 1
-    height = self.get_height() - 1
-    top_left = self.get_top_left()
-    # Scan through all the points within the bounds of the shape and check that
-    # they form a box.
-    for x in range(0, width + 1):
-      for y in range(0, height + 1):
-        expect_wall = (x == 0) or (x == width) or (y == 0) or (y == height)
-        found_wall = (top_left.x + x, top_left.y + y) in points
-        if expect_wall:
-          if not found_wall:
-            # If we expected a wall and there was none it's definitely not a
-            # box.
-            return False
-        else:
-          if (not allow_internal) and found_wall:
-            # If we didn't expect a wall that's okay if allow_internal is True.
-            # If it's not, however, we don't allow there to be walls were we
-            # don't expect them.
-            return False
-    return True
-
-
-  @staticmethod
-  def get_bounds_from_points(points):
-    top_left_x = sys.maxint
-    top_left_y = sys.maxint
-    bottom_right_x = -sys.maxint
-    bottom_right_y = -sys.maxint
-    for (x, y) in points:
-      top_left_x = min(top_left_x, x)
-      top_left_y = min(top_left_y, y)
-      # Nodes are considered to have width 1 so we add 1 to get their 
-      # right/bottom bounds.
-      bottom_right_x = max(bottom_right_x, x)
-      bottom_right_y = max(bottom_right_y, y)
-    return Rect(Point(top_left_x, top_left_y),
-      Point(bottom_right_x + 1, bottom_right_y + 1))
-
-  def __str__(self):
-    return "r%s->%s" % (self.top_left, self.bottom_right)
-
-
-class Point(object):
-
-  def __init__(self, x, y):
-    self.x = x
-    self.y = y
-
-  def get_x(self):
-    return self.x
-
-  def get_y(self):
-    return self.y
-
-  def __str__(self):
-    return "(%s, %s)" % (self.x, self.y)
-
-
-# A bitmap that knows where the walls are in a shape.
-class WallMap(object):
-
-  def __init__(self, walls):
-    self.walls = walls
-
-  def has_wall(self, x, y):
-    return (x, y) in self.walls
 
 
 def get_unit_test_suite():
@@ -1650,10 +1401,10 @@ def get_unit_test_suite():
       def flatten_rect(rect):
         return (rect.top_left.x, rect.top_left.y, rect.get_width(), rect.get_height())
       def flatten_shape(shape):
-        if isinstance(shape, BoxShape):
+        if isinstance(shape, dom.BoxShape):
           bounds = shape.get_bounds()
           return box(*flatten_rect(bounds))
-        elif isinstance(shape, TableShape):
+        elif isinstance(shape, dom.TableShape):
           bounds = shape.get_bounds()
           return table(*(list(flatten_rect(bounds)) + [flatten_rect(c.get_bounds()) for c in shape.get_cells()]))
         else:

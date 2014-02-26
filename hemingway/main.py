@@ -76,7 +76,8 @@
 import argparse
 import glob
 import logging
-import lnb
+import lnb.diagram
+import lnb.dom
 import os.path
 import Queue
 import re
@@ -683,7 +684,7 @@ class DiagramBlock(object):
 
   def to_html(self, context):
     padded_lines = self.get_padded_lines()
-    processor = lnb.DiagramProcessor(padded_lines)
+    processor = lnb.diagram.DiagramProcessor(padded_lines)
     diagram = processor.get_diagram()
     elements = []
     width = 0
@@ -692,9 +693,9 @@ class DiagramBlock(object):
       bounds = shape.get_bounds()
       width = max(width, bounds.bottom_right.x)
       height = max(height, bounds.bottom_right.y)
-      if shape.get_type() == lnb.Shape.BOX:
+      if shape.get_type() == lnb.dom.BoxShape.TYPE:
         elements.append(self.box_to_svg(shape))
-      elif shape.get_type() == lnb.Shape.TABLE:
+      elif shape.get_type() == lnb.dom.TableShape.TYPE:
         elements.append(self.table_to_svg(shape))
     return _DIAGRAM_TEMPLATE % {
       "elements": "\n".join(elements),
@@ -1208,7 +1209,7 @@ def please_run_the_tests():
   suite = unittest.TestSuite()
   loader = unittest.TestLoader()
   suite.addTests(loader.loadTestsFromTestCase(HemingwayTest))
-  suite.addTests(loader.loadTestsFromTestCase(lnb.get_unit_test_suite()))
+  suite.addTests(loader.loadTestsFromTestCase(lnb.diagram.get_unit_test_suite()))
   unittest.TextTestRunner().run(suite)
 
 
