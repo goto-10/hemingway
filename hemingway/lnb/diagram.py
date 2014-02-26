@@ -547,8 +547,14 @@ class DiagramProcessor(object):
         if candidate.is_monochrome or candidate.get_component() != component:
           continue
         nodes.append(candidate)
-      proto_shape = dom.UnknownShape(self, nodes)
-      shape = self.shape_registry.resolve(self, proto_shape)
+      # Determine the location and extent of the shape in absolute coordinates.
+      absolute_points = [(n.x, n.y) for n in nodes]
+      absolute_bounds = dom.Rect.get_bounds_from_points(absolute_points)
+      # Adjust to get the relative coordinates.
+      (ax, ay) = absolute_bounds.get_top_left()
+      relative_points = [(x - ax, y - ay) for (x, y) in absolute_points]
+      element = dom.TextElement(self, absolute_bounds, relative_points)
+      shape = self.shape_registry.resolve(element)
       enclosing[component] = shape
       shapes.append(shape)
     return shapes
@@ -578,6 +584,15 @@ class DiagramProcessor(object):
   # Returns the shapes identified in this diagram.
   def get_shapes(self):
     return self.shapes
+
+  # Returns the character at position (x, y) relative to the top left corner of
+  # this diagram.
+  def get_character(self, x, y):
+    if 0 <= y and y < len(self.lines):
+      row = self.lines[y]
+      if 0 <= x and x < len(row):
+        return row[x]
+    return ' '
 
 
 def get_unit_test_suite():
@@ -1396,17 +1411,22 @@ def get_unit_test_suite():
     def test_shapes(self):
       def box(x, y, w, h):
         return ("box", x, y, w, h)
-      def table(x, y, w, h, *cells):
-        return ("table", x, y, w, h, cells)
+      def table(x, y, w, h, cols, rows):
+        result = ["table", x, y, w, h]
+        if len(cols) > 0:
+          result += [["cols"] + list(cols)]
+        if len(rows) > 0:
+          result += [["rows"] + list(rows)]
+        return result
       def flatten_rect(rect):
         return (rect.top_left.x, rect.top_left.y, rect.get_width(), rect.get_height())
       def flatten_shape(shape):
+        (x, y) = shape.get_position()
+        (w, h) = shape.get_extent()
         if isinstance(shape, dom.BoxShape):
-          bounds = shape.get_bounds()
-          return box(*flatten_rect(bounds))
+          return box(x, y, w, h)
         elif isinstance(shape, dom.TableShape):
-          bounds = shape.get_bounds()
-          return table(*(list(flatten_rect(bounds)) + [flatten_rect(c.get_bounds()) for c in shape.get_cells()]))
+          return table(x, y, w, h, shape.get_columns(), shape.get_rows())
         else:
           return None
       def run_test(expected, lines):
@@ -1455,8 +1475,8 @@ def get_unit_test_suite():
 
       run_test([
         table(1, 1, 7, 5,
-          (2, 2, 5, 1),
-          (2, 4, 5, 1)),
+          [],
+          [2])
       ], [
         "         ",
         " +-----+ ",
@@ -1469,10 +1489,8 @@ def get_unit_test_suite():
 
       run_test([
         table(1, 1, 7, 5,
-          (2, 2, 2, 1),
-          (2, 4, 2, 1),
-          (5, 2, 2, 1),
-          (5, 4, 2, 1))
+          [3],
+          [2])
       ], [
         "         ",
         " +--+--+ ",
@@ -1481,6 +1499,21 @@ def get_unit_test_suite():
         " |  |  | ",
         " +--+--+ ",
         "         ",
+      ])
+
+      run_test([
+        table(4, 2, 11, 5,
+          [3, 6],
+          [2])
+      ], [
+        "                ",
+        "                ",
+        "    +--+--+---+ ",
+        "    |  |  |   | ",
+        "    +--+--+---+ ",
+        "    |  |  |   | ",
+        "    +--+--+---+ ",
+        "                ",
       ])
 
   return LinesAndBoxesTest

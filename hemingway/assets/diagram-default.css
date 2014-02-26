@@ -19,3 +19,8 @@
   overflow: hidden;
   font-size: 10pt;
 }
+
+.lnb .tablerow, .lnb .tablecol {
+  stroke-width: 1px;
+  stroke: black;
+}

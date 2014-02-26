@@ -34,32 +34,28 @@ class Shape(object):
   
   IRREGULAR = 'irregular'
 
-  def __init__(self, origin, nodes):
-    self.origin = origin
-    self.nodes = nodes
-    self.bounds_cache = None
-    self.walls_cache = None
+  def __init__(self, element):
+    self.element = element
 
   # Returns a string that identifies the type of this shape.
   @abstractmethod
   def get_type(self):
     return None
 
-  # Returns a bounding rectangle that fully contains this shape.
-  def get_bounds(self):
-    if self.bounds_cache is None:
-      self.bounds_cache = Rect.get_bounds_from_points([(n.x, n.y) for n in self.nodes])
-    return self.bounds_cache
+  # Returns a point giving the width and height of this shape.
+  def get_extent(self):
+    return self.element.get_extent()
+
+  # Returns the position (top left x and y) of this shape in the whole diagram.
+  def get_position(self):
+    return self.element.get_position()
+
+  def get_absolute_bounds(self):
+    return self.element.get_absolute_bounds()
 
   # Returns a WallMap that describes the walls of this shape.
-  def get_walls(self):
-    if self.walls_cache is None:
-      self.walls_cache = WallMap(set([(n.x, n.y) for n in self.nodes]))
-    return self.walls_cache
-
-  # Returns an array of this shape's nodes.
-  def get_nodes(self):
-    return self.nodes
+  def get_element(self):
+    return self.element
 
 
 # A shape that encloses a region, for instance a box.
@@ -81,36 +77,26 @@ class BoxShape(EnclosingShape):
 
   TYPE = 'box'
 
-  def __init__(self, origin, nodes, bounds):
-    super(BoxShape, self).__init__(origin, nodes)
-    self.bounds = bounds
-
   def get_type(self):
     return BoxShape.TYPE
 
-  # Returns a rect that describes the bounds of this box.
-  def get_bounds(self):
-    return self.bounds
-
   @staticmethod
-  def try_resolve(origin, proto):
-    return BoxShape.try_create(origin, proto, False)
+  def try_resolve(element):
+    return BoxShape.try_create(element, False)
 
   # Attempts to create a box shape from the given nodes. If the nodes are not
   # a box None will be returned.
   @staticmethod
-  def try_create(origin, proto, allow_internal):
-    bounds = proto.get_bounds()
-    walls = proto.get_walls()
-    width = bounds.get_width() - 1
-    height = bounds.get_height() - 1
-    top_left = bounds.get_top_left()
+  def try_create(element, allow_internal):
+    (width, height) = element.get_extent()
     # Scan through all the points within the bounds of the shape and check that
     # they form a box.
-    for x in range(0, width + 1):
-      for y in range(0, height + 1):
-        expect_wall = (x == 0) or (x == width) or (y == 0) or (y == height)
-        found_wall = walls.has_wall(top_left.x + x, top_left.y + y)
+    right_boundary = width - 1
+    bottom_boundary = height - 1
+    for x in range(0, width):
+      for y in range(0, height):
+        expect_wall = (x == 0) or (x == right_boundary) or (y == 0) or (y == bottom_boundary)
+        found_wall = element.has_wall(x, y)
         if expect_wall:
           if not found_wall:
             # If we expected a wall and there was none it's definitely not a
@@ -122,17 +108,18 @@ class BoxShape(EnclosingShape):
             # If it's not, however, we don't allow there to be walls were we
             # don't expect them.
             return None
-    return BoxShape(origin, proto.get_nodes(), bounds)
+    return BoxShape(element)
 
 
 class TableShape(Shape):
 
   TYPE = 'table'
 
-  def __init__(self, origin, nodes, boundary, cells):
-    super(TableShape, self).__init__(origin, nodes)
+  def __init__(self, element, boundary, cols, rows):
+    super(TableShape, self).__init__(element)
     self.boundary = boundary
-    self.cells = cells
+    self.cols = cols
+    self.rows = rows
 
   def get_type(self):
     return TableShape.TYPE
@@ -140,27 +127,44 @@ class TableShape(Shape):
   def get_boundary(self):
     return self.boundary
 
+  def get_columns(self):
+    return self.cols
+
+  def get_rows(self):
+    return self.rows
+
   @staticmethod
-  def try_resolve(origin, proto):
+  def try_resolve(element):
     # Is the shape completely enclosed within a box?
-    boundary = BoxShape.try_create(origin, proto, True)
+    boundary = BoxShape.try_create(element, True)
     if boundary is None:
       return None
-    # Are all the regions within the table rectangular?
-    regions = origin.get_diagram().get_regions()
-    cells = []
-    for region in regions:
-      if not proto.get_bounds().contains(region.get_bounds()):
-        continue
-      if region.is_square():
-        cells.append(region)
-      else:
-        return None
-    return TableShape(origin, proto.get_nodes(), boundary, cells)
-
-  # Returns the list of cells within this table.
-  def get_cells(self):
-    return self.cells
+    (width, height) = element.get_extent()
+    rows = []
+    # Scan through the inside of the element looking for horizontal dividers.
+    for row in range(1, height - 1):
+      has_divider = True
+      for col in range(1, width - 1):
+        if not element.has_wall(col, row):
+          has_divider = False
+          break
+      if has_divider:
+        rows.append(row)
+    # Ditto vertical dividers.
+    cols = []
+    for col in range(1, width - 1):
+      has_divider = True
+      for row in range(1, height - 1):
+        if not element.has_wall(col, row):
+          has_divider = False
+          break
+      if has_divider:
+        cols.append(col)
+    if (len(cols) == 0) and (len(rows) == 0):
+      # Found no dividers so this doesn't look like a table.
+      return None
+    else:
+      return TableShape(element, boundary, cols, rows)
 
 
 # A shape that's not recognized as any other "nice" form.
@@ -193,12 +197,12 @@ class ShapeRegistry(object):
 
   # Returns the most specific shape from this registry that recognizes the given
   # diagram element.
-  def resolve(self, origin, proto):
+  def resolve(self, element):
     for ShapeType in self.shapes:
-      result = ShapeType.try_resolve(origin, proto)
+      result = ShapeType.try_resolve(element)
       if not result is None:
         return result
-    return IrregularShape(origin, proto)
+    return IrregularShape(element)
 
   # Adds a shape class to the set recognized by this registry. The handler will
   # be matched only after any other handlers that have been added before have
@@ -263,6 +267,13 @@ class Rect(object):
 
   def get_height(self):
     return self.bottom_right.get_y() - self.top_left.get_y()
+
+  def get_extent(self):
+    return Point(self.get_width(), self.get_height())
+
+  def __iter__(self):
+    yield self.top_left
+    yield self.bottom_right
 
   # Returns True iff this rectangle completely contains the given rect.
   def contains(self, that):
@@ -332,6 +343,10 @@ class Point(object):
   def __str__(self):
     return "(%s, %s)" % (self.x, self.y)
 
+  def __iter__(self):
+    yield self.x
+    yield self.y
+
 
 # A bitmap that knows where the walls are in a shape.
 class WallMap(object):
@@ -341,3 +356,53 @@ class WallMap(object):
 
   def has_wall(self, x, y):
     return (x, y) in self.walls
+
+
+# An individual element within a text diagram. Provides access to information
+# about the element completely separated from the rest of the diagram. Also,
+# by default coordinates are relative to the element itself not the full
+# diagram so the top left corner is at (0, 0) regardless of where in the diagram
+# the element is located.
+class TextElement(object):
+
+  def __init__(self, processor, absolute_bounds, relative_points):
+    self.processor = processor
+    self.absolute_bounds = absolute_bounds
+    self.relative_points = relative_points
+    self.relative_point_set = set(relative_points)
+
+  # Returns the character at position (x, y) relative to the top left corner of
+  # the element.
+  def get_character(self, x, y):
+    if not (x, y) in self.relative_point_set:
+      return ' '
+    else:
+      (tx, ty) = self.absolute_bounds.get_top_left()
+      return self.processor.get_character(tx + x, ty + y)
+
+  # Does this element have a wall at relative position (x, y)?
+  def has_wall(self, x, y):
+    return (x, y) in self.relative_point_set
+
+  # Returns the extent of this element, that is, a point giving the width and
+  # height of the element.
+  def get_extent(self):
+    return self.absolute_bounds.get_extent()
+
+  # Returns the (x, y) of the top left corner of this element within the full
+  # diagram.
+  def get_position(self):
+    return self.absolute_bounds.get_top_left()
+
+  def get_absolute_bounds(self):
+    return self.absolute_bounds
+
+  def __str__(self):
+    (w, h) = self.absolute_bounds.get_extent()
+    rows = []
+    for y in range(0, h):
+      col = []
+      for x in range(0, w):
+        col.append(self.get_character(x, y))
+      rows.append("".join(col))
+    return "\n".join(rows)

@@ -655,7 +655,14 @@ _BOX_TEMPLATE = """
 <foreignObject x="%(x)s" y="%(y)s" width="%(width)s" height="%(height)s" position="static">
   <div xmlns="http://www.w3.org/1999/xhtml" class="boxbody">%(contents)s</div>
 </foreignObject>
+"""
 
+_ROW_TEMPLATE = """
+<line class="tablerow" x1="%(x1)s" y1="%(y1)s" x2="%(x2)s" y2="%(y2)s"/>
+"""
+
+_COL_TEMPLATE = """
+<line class="tablecol" x1="%(x1)s" y1="%(y1)s" x2="%(x2)s" y2="%(y2)s"/>
 """
 
 
@@ -687,20 +694,20 @@ class DiagramBlock(object):
     processor = lnb.diagram.DiagramProcessor(padded_lines)
     diagram = processor.get_diagram()
     elements = []
-    width = 0
-    height = 0
+    right_x = 0
+    bottom_y = 0
     for shape in diagram.get_shapes():
-      bounds = shape.get_bounds()
-      width = max(width, bounds.bottom_right.x)
-      height = max(height, bounds.bottom_right.y)
+      ((lx, ty), (rx, by)) = shape.get_absolute_bounds()
+      right_x = max(right_x, rx)
+      bottom_y = max(bottom_y, by)
       if shape.get_type() == lnb.dom.BoxShape.TYPE:
         elements.append(self.box_to_svg(shape))
       elif shape.get_type() == lnb.dom.TableShape.TYPE:
         elements.append(self.table_to_svg(shape))
     return _DIAGRAM_TEMPLATE % {
       "elements": "\n".join(elements),
-      "width": self.to_x(width + 1),
-      "height": self.to_y(height + 1)
+      "width": self.to_x(right_x + 1),
+      "height": self.to_y(bottom_y + 1)
     }
 
   def to_y(self, v):
@@ -710,17 +717,38 @@ class DiagramBlock(object):
     return "%sem" % (v * DiagramBlock.VERT_PER_HORZ)
 
   def box_to_svg(self, box):
-    bounds = box.get_bounds()
+    (x, y) = box.get_position()
+    (w, h) = box.get_extent()
     return _BOX_TEMPLATE % {
-      "x": self.to_x(bounds.get_top_left().get_x()),
-      "y": self.to_y(bounds.get_top_left().get_y()),
-      "width": self.to_x(bounds.get_width()),
-      "height": self.to_y(bounds.get_height()),
+      "x": self.to_x(x),
+      "y": self.to_y(y),
+      "width": self.to_x(w),
+      "height": self.to_y(h),
       "contents": ""
     }
 
   def table_to_svg(self, table):
-    return self.box_to_svg(table.get_boundary())
+    (x, y) = table.get_position()
+    (w, h) = table.get_extent()
+    parts = []
+    parts.append(self.box_to_svg(table.get_boundary()))
+    for row in table.get_rows():
+      part = _ROW_TEMPLATE % {
+        "x1": self.to_x(x),
+        "y1": self.to_y(y + row + 0.5),
+        "x2": self.to_x(x + w),
+        "y2": self.to_y(y + row + 0.5)
+      }
+      parts.append(part)
+    for col in table.get_columns():
+      part = _COL_TEMPLATE % {
+        "x1": self.to_x(x + col + 0.5),
+        "y1": self.to_y(y),
+        "x2": self.to_x(x + col + 0.5),
+        "y2": self.to_y(y + h)
+      }
+      parts.append(part)
+    return "".join(parts)
 
 
 ## ## Language Processing
