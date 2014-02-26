@@ -1408,6 +1408,41 @@ def get_unit_test_suite():
         "         "
       ])
 
+    def test_elements(self):
+      processor = DiagramProcessor([
+        "                   ",
+        " +------------+    ",
+        " |            |    ",
+        " |  +------+  |    ",
+        " |  |      |  |    ",
+        " |  | +--+ +--+    ",
+        " |  | |  |         ",
+        " |  | |  +-------+ ",
+        " |  | |          | ",
+        " +--+ +----------+ ",
+        "                   ",
+      ])
+      shapes = processor.get_diagram().get_shapes()
+      self.assertEquals(2, len(shapes))
+      self.assertEquals(str(shapes[0].get_element()), "\n".join([
+        "+------------+",
+        "|            |",
+        "|  +------+  |",
+        "|  |      |  |",
+        "|  |      +--+",
+        "|  |          ",
+        "|  |          ",
+        "|  |          ",
+        "+--+          ",
+      ]))
+      self.assertEquals(str(shapes[1].get_element()), "\n".join([
+        "+--+        ",
+        "|  |        ",
+        "|  +-------+",
+        "|          |",
+        "+----------+",
+      ]))
+
     def test_shapes(self):
       def box(x, y, w, h):
         return ("box", x, y, w, h)
