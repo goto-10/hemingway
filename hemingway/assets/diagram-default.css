@@ -1,17 +1,17 @@
-.lnb .diagram {
+.linesboxes .diagram {
   margin: 10px;
   font-size: 12pt;
   line-height: 1;
   font-family: sans-serif;
 }
 
-.lnb .box {
+.linesboxes .box {
   fill: white;
   stroke: black;
   stroke-width: 1px;
 }
 
-.lnb .boxbody {
+.linesboxes .boxbody {
   padding-left: 2px;
   padding-right: 2px;
   padding-top: 2px;
@@ -20,7 +20,7 @@
   font-size: 10pt;
 }
 
-.lnb .tablerow, .lnb .tablecol {
+.linesboxes .tablerow, .linesboxes .tablecol {
   stroke-width: 1px;
   stroke: black;
 }

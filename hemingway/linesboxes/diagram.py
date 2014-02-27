@@ -144,7 +144,17 @@ _DEFAULT_DIAGRAM_CHARACTER_REGISTRY = (
       "***",
       "   ",
     ])
+    .add_char("=", [
+      "   ",
+      "***",
+      "   ",
+    ])
     .add_char("|", [
+      " * ",
+      " * ",
+      " * ",
+    ])
+    .add_char(":", [
       " * ",
       " * ",
       " * ",
@@ -411,7 +421,7 @@ class DiagramProcessor(object):
   # Flood fills all spaces between nodes.
   def flood_fill_spaces(self):
     colors = {}
-    spaces = self.get_spaces()
+    spaces = self.get_padded_spaces()
     def flood_space(root, color):
       worklist = set([root])
       while len(worklist) > 0:
@@ -486,6 +496,20 @@ class DiagramProcessor(object):
     for y in range(0, len(self.lines)):
       row = self.lines[y]
       for x in range(0, len(row)):
+        if not (x, y) in self.full_nodes:
+          result.append((x, y))
+    return sorted(result)
+
+  # Returns a sorted list of all the spaces in the diagram, as well as one space
+  # if padding all around the diagram. The padding is there because the space
+  # coloring should behave as if the diagram were surrounded by an infinite area
+  # of space rather than "boxed in" by the edges of the diagram.
+  def get_padded_spaces(self):
+    result = []
+    height = len(self.lines)
+    width = reduce(max, map(len, self.lines), 0)
+    for y in range(-1, height + 1):
+      for x in range(-1, width + 1):
         if not (x, y) in self.full_nodes:
           result.append((x, y))
     return sorted(result)
@@ -1325,6 +1349,15 @@ def get_unit_test_suite():
         " --------> ",
         "           "
       ])
+      run_test([
+        "aaaaaa",
+        "------",
+        "aaaaaa",
+      ], [
+        "      ",
+        "------",
+        "      ",
+      ])
 
     def test_monochrome_nodes(self):
       def run_test(expected, lines):
@@ -1550,6 +1583,17 @@ def get_unit_test_suite():
         " |  |  | ",
         " +--+--+ ",
         "         ",
+      ])
+      run_test([
+        table(0, 0, 7, 5,
+          [3],
+          [2])
+      ], [
+        "+--+--+",
+        "|  |  |",
+        "+--+--+",
+        "|  |  |",
+        "+--+--+",
       ])
 
       run_test([
