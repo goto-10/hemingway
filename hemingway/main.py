@@ -66,7 +66,7 @@
 ##     each part appropriately.
 ##   - The file handling (open, closing, watching) is done by the {{#Main}}(main)
 ##     class.
-##   - The {{lnb.py}}(diagram processor) analyzes ascii diagrams and produces
+##   - The {{diagram.py}}(diagram processor) analyzes ascii diagrams and produces
 ##     corresponding images.
 ##
 ## The {{#UnitTests}}(please_run_the_tests) function runs the unit
@@ -76,8 +76,8 @@
 import argparse
 import glob
 import logging
-import lnb.diagram
-import lnb.dom
+import linesboxes.diagram
+import linesboxes.dom
 import os.path
 import Queue
 import re
@@ -642,7 +642,7 @@ class CodeBlock(object):
 
 
 _DIAGRAM_TEMPLATE = """
-  <div class="lnb">
+  <div class="linesboxes">
     <svg width="%(width)s" height="%(height)s" class="diagram">
       %(elements)s
     </svg>
@@ -691,7 +691,7 @@ class DiagramBlock(object):
 
   def to_html(self, context):
     padded_lines = self.get_padded_lines()
-    processor = lnb.diagram.DiagramProcessor(padded_lines)
+    processor = linesboxes.diagram.DiagramProcessor(padded_lines)
     diagram = processor.get_diagram()
     elements = []
     right_x = 0
@@ -700,9 +700,9 @@ class DiagramBlock(object):
       ((lx, ty), (rx, by)) = shape.get_absolute_bounds()
       right_x = max(right_x, rx)
       bottom_y = max(bottom_y, by)
-      if shape.get_type() == lnb.dom.BoxShape.TYPE:
+      if shape.get_type() == linesboxes.dom.BoxShape.TYPE:
         elements.append(self.box_to_svg(shape))
-      elif shape.get_type() == lnb.dom.TableShape.TYPE:
+      elif shape.get_type() == linesboxes.dom.TableShape.TYPE:
         elements.append(self.table_to_svg(shape))
     return _DIAGRAM_TEMPLATE % {
       "elements": "\n".join(elements),
@@ -1237,7 +1237,7 @@ def please_run_the_tests():
   suite = unittest.TestSuite()
   loader = unittest.TestLoader()
   suite.addTests(loader.loadTestsFromTestCase(HemingwayTest))
-  suite.addTests(loader.loadTestsFromTestCase(lnb.diagram.get_unit_test_suite()))
+  suite.addTests(loader.loadTestsFromTestCase(linesboxes.diagram.get_unit_test_suite()))
   unittest.TextTestRunner().run(suite)
 
 

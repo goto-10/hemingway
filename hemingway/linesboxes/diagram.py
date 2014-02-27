@@ -1443,6 +1443,22 @@ def get_unit_test_suite():
         "+----------+",
       ]))
 
+    def test_lines(self):
+      processor = DiagramProcessor([
+        "                         ",
+        "  +----------------+     ",
+        "  |                |  ^  ",
+        "  |  +----------+  |  |  ",
+        "  |  |             |  |  ",
+        "  |  |  <----------+  |  ",
+        "  |  |                |  ",
+        "  |  +---------->     |  ",
+        "  |                   |  ",
+        "  +-------------------+  ",
+        "                         ",
+      ])
+      processor.get_diagram()
+
     def test_shapes(self):
       def box(x, y, w, h):
         return ("box", x, y, w, h)

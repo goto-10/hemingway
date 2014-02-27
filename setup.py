@@ -7,8 +7,8 @@ setuptools.setup(
   name = "Hemingway",
   version = "0.0.1",
   description = "",
-  author = "Christian Plesner Hansen",
-  url = "http://c7n.p5r.org",
+  author = "GOTO 10",
+  url = "http://goto-10.github.io/hemingway",
   packages = setuptools.find_packages(),
   entry_points = {
     'console_scripts': [
