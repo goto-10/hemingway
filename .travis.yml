@@ -1,0 +1,3 @@
+language: python
+compiler: gcc
+script: ./hemingway/main.py please run the tests

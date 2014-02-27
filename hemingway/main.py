@@ -1222,9 +1222,9 @@ def please_run_the_tests():
       run_test("///", "//")
       run_test("#//", "#/")
 
-    def test_strip_marker(self):
+    def test_strip_prefix(self):
       def run_test(expected, marker, line):
-        found = CommentBlock.strip_marker(marker, line)
+        found = CommentBlock.strip_prefix(marker, line)
         self.assertEquals(expected, found)
       run_test("Foo", "#", "#Foo")
       run_test("Foo", "#", "# Foo")
