@@ -28,34 +28,56 @@ class Region(object):
     return "region(%s)" % self.get_bounds()
 
 
-# Abstract superclass of diagram shapes.
-class Shape(object):
+class Element(object):
   __metaclass__ = ABCMeta
-  
-  IRREGULAR = 'irregular'
 
-  def __init__(self, element):
-    self.element = element
+  def __init__(self, text):
+    self.text = text
 
-  # Returns a string that identifies the type of this shape.
+  # Returns a string that identifies the type of this element.
   @abstractmethod
   def get_type(self):
     return None
 
   # Returns a point giving the width and height of this shape.
   def get_extent(self):
-    return self.element.get_extent()
+    return self.text.get_extent()
 
   # Returns the position (top left x and y) of this shape in the whole diagram.
   def get_position(self):
-    return self.element.get_position()
+    return self.text.get_position()
 
   def get_absolute_bounds(self):
-    return self.element.get_absolute_bounds()
+    return self.text.get_absolute_bounds()
 
-  # Returns a WallMap that describes the walls of this shape.
-  def get_element(self):
-    return self.element
+  # Returns a text component that provides access to the underlying text of this
+  # shape.
+  def get_text_component(self):
+    return self.text
+
+  def __init__(self, text):
+    self.text = text
+
+
+class Path(Element):
+
+  TYPE = 'path'
+
+  def __init__(self, text, points):
+    super(Path, self).__init__(text)
+    self.points = points
+
+  def get_type(self):
+    return Path.TYPE
+
+  def get_points(self):
+    return self.points
+
+
+# Abstract superclass of diagram shapes.
+class Shape(Element):
+  
+  IRREGULAR = 'irregular'
 
 
 # A shape that encloses a region, for instance a box.
@@ -174,14 +196,6 @@ class IrregularShape(Shape):
     return None
 
 
-# This type is used temporarily while determining which kind of shape a set of
-# nodes correspond to.
-class UnknownShape(Shape):
-  
-  def get_type(self):
-    return None
-
-
 ## ## Shape registry
 ##
 ## A shape registry contains a list of types of shapes that are used to resolve
@@ -233,9 +247,19 @@ class Diagram(object):
     self.origin = origin
     self.regions = None
 
-  def get_shapes(self):
-    assert not self.origin.shapes is None
-    return self.origin.shapes
+  def get_elements(self):
+    assert not self.origin.elements is None
+    return self.origin.elements
+
+  # Returns the element that has a wall at (x, y). If there is no such element
+  # None is returned.
+  def get_element_under(self, x, y):
+    for element in self.get_elements():
+      text = element.get_text_component()
+      (lx, ty) = text.get_position()
+      if text.has_wall(x - lx, y - ty):
+        return element
+    return None
 
   def get_regions(self):
     if not self.regions is None:
@@ -307,6 +331,10 @@ class Rect(object):
             return False
     return True
 
+  # Given a point (x, y) returns a new point that is relative to the top left
+  # corner of this rect.
+  def make_point_relative(self, (x, y)):
+    return (x - self.top_left.x, y - self.top_left.y)
 
   @staticmethod
   def get_bounds_from_points(points):
@@ -348,22 +376,12 @@ class Point(object):
     yield self.y
 
 
-# A bitmap that knows where the walls are in a shape.
-class WallMap(object):
-
-  def __init__(self, walls):
-    self.walls = walls
-
-  def has_wall(self, x, y):
-    return (x, y) in self.walls
-
-
-# An individual element within a text diagram. Provides access to information
+# An individual component within a text diagram. Provides access to information
 # about the element completely separated from the rest of the diagram. Also,
 # by default coordinates are relative to the element itself not the full
 # diagram so the top left corner is at (0, 0) regardless of where in the diagram
 # the element is located.
-class TextElement(object):
+class TextComponent(object):
 
   def __init__(self, processor, absolute_bounds, relative_points):
     self.processor = processor

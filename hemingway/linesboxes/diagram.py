@@ -6,27 +6,27 @@
 ##
 ## Lines And Boxes converts ascii diagrams such as
 ##
-##                   /------\           
-##       +-------+   |      |           
-##       |       |   | +--+ |   +--+--+ 
-##       +-------+   | |  | |   |  |  | 
-##                   | +--+ |   +--+--+ 
-##                   |      |   |  |  | 
-##          +---+    \------/   |  |  | 
-##          |   |               +--+--+ 
-##          +---+                       
+##                   /------\
+##       +-------+   |      |
+##       |       |   | +--+ |   +--+--+
+##       +-------+   | |  | |   |  |  |
+##                   | +--+ |   +--+--+
+##                   |      |   |  |  |
+##          +---+    \------/   |  |  |
+##          |   |               +--+--+
+##          +---+
 ##
 ## to SVG diagrams, in this case for instance
 ##
-#%                   /------\           
-#%       +-------+   |      |           
-#%       |       |   | +--+ |   +--+--+ 
-#%       +-------+   | |  | |   |  |  | 
-#%                   | +--+ |   +--+--+ 
-#%                   |      |   |  |  | 
-#%          +---+    \------/   |  |  | 
-#%          |   |               +--+--+ 
-#%          +---+                       
+#%                   /------\
+#%       +-------+   |      |
+#%       |       |   | +--+ |   +--+--+
+#%       +-------+   | |  | |   |  |  |
+#%                   | +--+ |   +--+--+
+#%                   |      |   |  |  |
+#%          +---+    \------/   |  |  |
+#%          |   |               +--+--+
+#%          +---+
 ##
 ## # Implementation
 
@@ -215,6 +215,7 @@ class Node(object):
     self.lowlink = None
     self.component = component
     self.is_monochrome = None
+    self.edges = sorted(set(self.ins + self.outs))
 
   def get_component(self):
     assert not self.component is None
@@ -223,18 +224,21 @@ class Node(object):
   def has_edge(self, edge):
     return (edge in self.ins) or (edge in self.outs)
 
+  def get_edges(self):
+    return self.edges
+
   def __str__(self):
     return str((self.x, self.y))
 
 
 ## ## Diagram processing
 ##
-## 
+##
 
 class DiagramProcessor(object):
 
-  def __init__(self, lines):
-    self.lines = lines
+  def __init__(self, text):
+    self.text = text
     self.half_nodes = None
     self.full_nodes = None
     self.space_colors = None
@@ -243,7 +247,7 @@ class DiagramProcessor(object):
     self.shape_registry = dom.ShapeRegistry().get_default()
     self.chars = DiagramCharacterRegistry.get_default()
 
-  # Processes the diagram lines.
+  # Processes the diagram text.
   def process(self):
     self.half_nodes = self.get_half_nodes()
     self.full_nodes = self.get_full_nodes()
@@ -252,7 +256,9 @@ class DiagramProcessor(object):
     self.regions = self.build_regions()
     self.mark_monochrome_nodes()
     self.diagram = dom.Diagram(self)
-    self.shapes = self.extract_shapes()
+    shapes = self.extract_shapes()
+    paths = self.extract_paths()
+    self.elements = shapes + paths
 
   # Returns the analyzed diagram object.
   def get_diagram(self):
@@ -267,7 +273,7 @@ class DiagramProcessor(object):
       return self.chars.get_half_node(char)
     def line_to_half_nodes(line):
       return [to_half_node(char) for char in line]
-    return map(line_to_half_nodes, self.lines)
+    return map(line_to_half_nodes, self.text)
 
   ## ### Building the set of full nodes.
   ##
@@ -353,13 +359,13 @@ class DiagramProcessor(object):
   ##
   ##         |  /
   ##         / / /-->
-  ##     <--/ / / 
+  ##     <--/ / /
   ##         /  |
   ##
   ## This means that if you have box with correct slanted corners there will be
   ## a directed flow clockwise all the way around the box, since the corners
   ## allow clockwise flow and the edges allow flow in both directions. If,
-  ## however, one of the corners is wrong, or the box is broken, the flow 
+  ## however, one of the corners is wrong, or the box is broken, the flow
   ## doesn't go all the way around and the elements won't make up a strongly
   ## connected component. And that's fine, then it's just a line or a set of
   ## lines and they get styled nicely too, just not as a box.
@@ -493,8 +499,8 @@ class DiagramProcessor(object):
   # with them. These are the positions to flood fill.
   def get_spaces(self):
     result = []
-    for y in range(0, len(self.lines)):
-      row = self.lines[y]
+    for y in range(0, len(self.text)):
+      row = self.text[y]
       for x in range(0, len(row)):
         if not (x, y) in self.full_nodes:
           result.append((x, y))
@@ -506,8 +512,8 @@ class DiagramProcessor(object):
   # of space rather than "boxed in" by the edges of the diagram.
   def get_padded_spaces(self):
     result = []
-    height = len(self.lines)
-    width = reduce(max, map(len, self.lines), 0)
+    height = len(self.text)
+    width = reduce(max, map(len, self.text), 0)
     for y in range(-1, height + 1):
       for x in range(-1, width + 1):
         if not (x, y) in self.full_nodes:
@@ -547,7 +553,7 @@ class DiagramProcessor(object):
         regions[color] = []
       regions[color].append(point)
     return dict([(c, dom.Region(c, p)) for (c, p) in regions.items()])
-    
+
 
   ## ### Extracting the diagram shapes
   ##
@@ -568,20 +574,52 @@ class DiagramProcessor(object):
         continue
       nodes = []
       for candidate in self.all_full_nodes():
-        if candidate.is_monochrome or candidate.get_component() != component:
-          continue
-        nodes.append(candidate)
+        if not candidate.is_monochrome and candidate.get_component() == component:
+          nodes.append(candidate)
       # Determine the location and extent of the shape in absolute coordinates.
       absolute_points = [(n.x, n.y) for n in nodes]
       absolute_bounds = dom.Rect.get_bounds_from_points(absolute_points)
       # Adjust to get the relative coordinates.
-      (ax, ay) = absolute_bounds.get_top_left()
-      relative_points = [(x - ax, y - ay) for (x, y) in absolute_points]
-      element = dom.TextElement(self, absolute_bounds, relative_points)
-      shape = self.shape_registry.resolve(element)
+      relative_points = map(absolute_bounds.make_point_relative, absolute_points)
+      text = dom.TextComponent(self, absolute_bounds, relative_points)
+      shape = self.shape_registry.resolve(text)
       enclosing[component] = shape
       shapes.append(shape)
     return shapes
+
+  def extract_paths(self):
+    points_visited = set()
+    def continue_path_from(current, points):
+      points_visited.add(current)
+      (x, y) = current
+      points.append(current)
+      node = self.get_full_node(x, y)
+      if len(node.get_edges()) == 2:
+        one = node.get_edges()[0]
+        two = node.get_edges()[1]
+        if one in points:
+          next = two
+        else:
+          assert two in points
+          next = one
+        continue_path_from(next, points)
+    result = []
+    for node in self.all_full_nodes():
+      current = (node.x, node.y)
+      if current in points_visited:
+        continue
+      if node.is_monochrome and len(node.get_edges()) == 1:
+        # Found the start point of a path
+        points_visited.add(current)
+        absolute_points = [current]
+        next_point = node.get_edges()[0]
+        continue_path_from(next_point, absolute_points)
+        absolute_bounds = dom.Rect.get_bounds_from_points(absolute_points)
+        relative_points = map(absolute_bounds.make_point_relative, absolute_points)
+        text = dom.TextComponent(self, absolute_bounds, relative_points)
+        path = dom.Path(text, relative_points)
+        result.append(path)
+    return result
 
   def all_full_nodes(self):
     for key in sorted(self.full_nodes.keys()):
@@ -612,8 +650,8 @@ class DiagramProcessor(object):
   # Returns the character at position (x, y) relative to the top left corner of
   # this diagram.
   def get_character(self, x, y):
-    if 0 <= y and y < len(self.lines):
-      row = self.lines[y]
+    if 0 <= y and y < len(self.text):
+      row = self.text[y]
       if 0 <= x and x < len(row):
         return row[x]
     return ' '
@@ -700,7 +738,7 @@ def get_unit_test_suite():
       run_test(left_only, right_only, HalfGraphNode(
           "   "
           ">>>"
-          "   "))      
+          "   "))
 
       run_test(right_only, left_only, HalfGraphNode(
           "   "
@@ -1441,7 +1479,7 @@ def get_unit_test_suite():
         "         "
       ])
 
-    def test_elements(self):
+    def test_shape_elements(self):
       processor = DiagramProcessor([
         "                   ",
         " +------------+    ",
@@ -1455,9 +1493,9 @@ def get_unit_test_suite():
         " +--+ +----------+ ",
         "                   ",
       ])
-      shapes = processor.get_diagram().get_shapes()
-      self.assertEquals(2, len(shapes))
-      self.assertEquals(str(shapes[0].get_element()), "\n".join([
+      elements = processor.get_diagram().get_elements()
+      self.assertEquals(2, len(elements))
+      self.assertEquals(str(elements[0].get_text_component()), "\n".join([
         "+------------+",
         "|            |",
         "|  +------+  |",
@@ -1468,7 +1506,7 @@ def get_unit_test_suite():
         "|  |          ",
         "+--+          ",
       ]))
-      self.assertEquals(str(shapes[1].get_element()), "\n".join([
+      self.assertEquals(str(elements[1].get_text_component()), "\n".join([
         "+--+        ",
         "|  |        ",
         "|  +-------+",
@@ -1476,21 +1514,74 @@ def get_unit_test_suite():
         "+----------+",
       ]))
 
+
+
     def test_lines(self):
-      processor = DiagramProcessor([
-        "                         ",
+      def run_test(expected, lines):
+        processor = DiagramProcessor(lines)
+        diagram = processor.get_diagram()
+        elements = diagram.get_elements()
+        def get_element_char(processor, x, y):
+          element = diagram.get_element_under(x, y)
+          if element is None:
+            return ' '
+          index = elements.index(element)
+          return chr(ord('a') + index)
+        found = LinesAndBoxesTest.get_diagram_property_map(expected, processor,
+          get_element_char)
+        self.assertEquals(expected, found)
+
+      run_test([
+        " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+        " a                                         a ",
+        " a   bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb   a ",
+        " a   b                                 b   a ",
+        " a   b   ccccccccccccccccccccccccccc   b   a ",
+        " a   b   c                         c   b   a ",
+        " a   b   c                         c   b   a ",
+        " a   b   c                         c   b   a ",
+        " a   b   ccccccccccccccccccccccccccc   b   a ",
+        " a   b                                 b   a ",
+        " a   bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb   a ",
+        " a                                         a ",
+        " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+      ], [
+        " +-----------------------------------------+ ",
+        " |                                         | ",
+        " |   +---------------------------------+   | ",
+        " |   |                                 |   | ",
+        " |   |   +-------------------------+   |   | ",
+        " |   |   |                         |   |   | ",
+        " |   |   |                         |   |   | ",
+        " |   |   |                         |   |   | ",
+        " |   |   +-------------------------+   |   | ",
+        " |   |                                 |   | ",
+        " |   +---------------------------------+   | ",
+        " |                                         | ",
+        " +-----------------------------------------+ ",
+      ])
+
+      run_test([
+        "  aaaaaaaaaaaaaaaaaa     ",
+        "  a                a  a  ",
+        "  a  bbbbbbbbbbbb  a  a  ",
+        "  a  b             a  a  ",
+        "  a  b  aaaaaaaaaaaa  a  ",
+        "  a  b                a  ",
+        "  a  bbbbbbbbbbbb     a  ",
+        "  a                   a  ",
+        "  aaaaaaaaaaaaaaaaaaaaa  ",
+      ], [
         "  +----------------+     ",
-        "  |                |  ^  ",
+        "  |                |  +  ",
         "  |  +----------+  |  |  ",
         "  |  |             |  |  ",
-        "  |  |  <----------+  |  ",
+        "  |  |  +----------+  |  ",
         "  |  |                |  ",
-        "  |  +---------->     |  ",
+        "  |  +----------+     |  ",
         "  |                   |  ",
         "  +-------------------+  ",
-        "                         ",
       ])
-      processor.get_diagram()
 
     def test_shapes(self):
       def box(x, y, w, h):
@@ -1502,22 +1593,25 @@ def get_unit_test_suite():
         if len(rows) > 0:
           result += [["rows"] + list(rows)]
         return result
+      def path(x, y, points):
+        return ("path", x, y, points)
       def flatten_rect(rect):
         return (rect.top_left.x, rect.top_left.y, rect.get_width(), rect.get_height())
-      def flatten_shape(shape):
-        (x, y) = shape.get_position()
-        (w, h) = shape.get_extent()
-        if isinstance(shape, dom.BoxShape):
+      def flatten_element(element):
+        (x, y) = element.get_position()
+        (w, h) = element.get_extent()
+        if isinstance(element, dom.BoxShape):
           return box(x, y, w, h)
-        elif isinstance(shape, dom.TableShape):
-          return table(x, y, w, h, shape.get_columns(), shape.get_rows())
+        elif isinstance(element, dom.TableShape):
+          return table(x, y, w, h, element.get_columns(), element.get_rows())
+        elif isinstance(element, dom.Path):
+          return path(x, y, element.get_points())
         else:
           return None
       def run_test(expected, lines):
-        diagram = DiagramProcessor(lines)
-        diagram.process()
-        shapes = diagram.get_shapes()
-        self.assertEquals(expected, map(flatten_shape, shapes))
+        processor = DiagramProcessor(lines)
+        elements = processor.get_diagram().get_elements()
+        self.assertEquals(expected, map(flatten_element, elements))
 
       run_test([
         box(1, 1, 4, 3)
@@ -1609,6 +1703,30 @@ def get_unit_test_suite():
         "    |  |  |   | ",
         "    +--+--+---+ ",
         "                ",
+      ])
+
+      run_test([
+        path(1, 0, [
+          (1, 2), (2, 2), (3, 2),
+          (3, 1), (3, 0),
+          (4, 0), (5, 0)
+        ])
+      ], [
+        "   +-- ",
+        "   |   ",
+        " --+   ",
+      ])
+
+      run_test([
+        path(1, 0, [
+          (1, 2), (2, 2), (3, 2),
+          (3, 1), (3, 0),
+          (4, 0), (5, 0)
+        ])
+      ], [
+        "   +-> ",
+        "   |   ",
+        " <-+   ",
       ])
 
   return LinesAndBoxesTest

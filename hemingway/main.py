@@ -555,21 +555,23 @@ class CommentBlock(object):
 
   def to_html(self, context):
     marker = self.language.get_marker()
-    result = []
-    for line in self.lines:
-      result.append(CommentBlock.strip_marker(marker, line))
-    result.append("")
-    return context.convert_markdown("\n".join(result))
+    stripped = CommentBlock.strip_prefixes(marker, self.lines)
+    stripped.append("")
+    return context.convert_markdown("\n".join(stripped))
 
   @staticmethod
-  def strip_marker(marker, line):
-    if marker is None:
+  def strip_prefixes(prefix, lines):
+    return [CommentBlock.strip_prefix(prefix, line) for line in lines]
+
+  @staticmethod
+  def strip_prefix(prefix, line):
+    if prefix is None:
       return line
-    index = line.find(marker)
+    index = line.find(prefix)
     if index == -1:
       return line
     else:
-      removed = line[index+len(marker):]
+      removed = line[index+len(prefix):]
       if removed.startswith(" "):
         removed = removed[1:]
       return removed
@@ -643,7 +645,7 @@ class CodeBlock(object):
 
 _DIAGRAM_TEMPLATE = """
   <div class="linesboxes">
-    <svg width="%(width)s" height="%(height)s" class="diagram">
+    <svg viewBox="0 0 %(width)s %(height)s" class="diagram">
       %(elements)s
     </svg>
   </div>
@@ -665,6 +667,17 @@ _COL_TEMPLATE = """
 <line class="tablecol" x1="%(x1)s" y1="%(y1)s" x2="%(x2)s" y2="%(y2)s"/>
 """
 
+_PATH_TEMPLATE = """
+<polyline class="path" points="%(points)s" />
+"""
+
+
+def to_x(v):
+  return 10 * v * DiagramBlock.VERT_PER_HORZ
+
+def to_y(v):
+  return 10 * v
+
 
 class DiagramBlock(object):
 
@@ -679,51 +692,48 @@ class DiagramBlock(object):
 
   def __init__(self, lines, language):
     self.lines = lines
+    self.language = language
 
   def is_empty(self):
     return len("".join(self.lines).strip()) == 0
 
   # Pad the lines with spaces all the way round.
-  def get_padded_lines(self):
-    max_len = max(map(len, self.lines))
-    padding = " " * (max_len + 2)
-    return [padding] + [" %s " % s for s in self.lines] + [padding]
+  def get_stripped_lines(self):
+    marker = self.language.get_diagram()
+    return CommentBlock.strip_prefixes(marker, self.lines)
 
   def to_html(self, context):
-    padded_lines = self.get_padded_lines()
+    padded_lines = self.get_stripped_lines()
     processor = linesboxes.diagram.DiagramProcessor(padded_lines)
     diagram = processor.get_diagram()
     elements = []
     right_x = 0
     bottom_y = 0
-    for shape in diagram.get_shapes():
-      ((lx, ty), (rx, by)) = shape.get_absolute_bounds()
+    for element in diagram.get_elements():
+      ((lx, ty), (rx, by)) = element.get_absolute_bounds()
       right_x = max(right_x, rx)
       bottom_y = max(bottom_y, by)
-      if shape.get_type() == linesboxes.dom.BoxShape.TYPE:
-        elements.append(self.box_to_svg(shape))
-      elif shape.get_type() == linesboxes.dom.TableShape.TYPE:
-        elements.append(self.table_to_svg(shape))
+      type = element.get_type()
+      if type == linesboxes.dom.BoxShape.TYPE:
+        elements.append(self.box_to_svg(element))
+      elif type == linesboxes.dom.TableShape.TYPE:
+        elements.append(self.table_to_svg(element))
+      elif type == linesboxes.dom.Path.TYPE:
+        elements.append(self.path_to_svg(element))
     return _DIAGRAM_TEMPLATE % {
       "elements": "\n".join(elements),
-      "width": self.to_x(right_x + 1),
-      "height": self.to_y(bottom_y + 1)
+      "width": to_x(right_x + 1),
+      "height": to_y(bottom_y + 1)
     }
-
-  def to_y(self, v):
-    return "%sem" % v
-
-  def to_x(self, v):
-    return "%sem" % (v * DiagramBlock.VERT_PER_HORZ)
 
   def box_to_svg(self, box):
     (x, y) = box.get_position()
     (w, h) = box.get_extent()
     return _BOX_TEMPLATE % {
-      "x": self.to_x(x),
-      "y": self.to_y(y),
-      "width": self.to_x(w),
-      "height": self.to_y(h),
+      "x": to_x(x + 0.5),
+      "y": to_y(y + 0.5),
+      "width": to_x(w - 1),
+      "height": to_y(h - 1),
       "contents": ""
     }
 
@@ -734,21 +744,29 @@ class DiagramBlock(object):
     parts.append(self.box_to_svg(table.get_boundary()))
     for row in table.get_rows():
       part = _ROW_TEMPLATE % {
-        "x1": self.to_x(x),
-        "y1": self.to_y(y + row + 0.5),
-        "x2": self.to_x(x + w),
-        "y2": self.to_y(y + row + 0.5)
+        "x1": to_x(x + 0.5),
+        "y1": to_y(y + row + 0.5),
+        "x2": to_x(x + w - 0.5),
+        "y2": to_y(y + row + 0.5)
       }
       parts.append(part)
     for col in table.get_columns():
       part = _COL_TEMPLATE % {
-        "x1": self.to_x(x + col + 0.5),
-        "y1": self.to_y(y),
-        "x2": self.to_x(x + col + 0.5),
-        "y2": self.to_y(y + h)
+        "x1": to_x(x + col + 0.5),
+        "y1": to_y(y + 0.5),
+        "x2": to_x(x + col + 0.5),
+        "y2": to_y(y + h - 0.5)
       }
       parts.append(part)
     return "".join(parts)
+
+  def path_to_svg(self, path):
+    (lx, ty) = path.get_position()
+    def to_absolute((x, y)):
+      return (to_x(x + lx + 0.5), to_y(y + ty + 0.5))
+    return _PATH_TEMPLATE % {
+      "points": " ".join("%s,%s" % p for p in map(to_absolute, path.get_points()))
+    }
 
 
 ## ## Language Processing
@@ -785,6 +803,10 @@ class LanguageInfo(object):
   # Returns the marker used to identify the lines that contain documentation.
   def get_marker(self):
     return self.marker
+
+  # Returns the marker used to identify lines that contain diagrams.
+  def get_diagram(self):
+    return self.diagram
 
   # Is the given line an end-of-line comment within this language?
   def is_comment(self, line):
