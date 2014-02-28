@@ -645,7 +645,7 @@ class CodeBlock(object):
 
 _DIAGRAM_TEMPLATE = """
   <div class="linesboxes">
-    <svg viewBox="0 0 %(width)s %(height)s" class="diagram">
+    <svg width="%(width)sem" height="%(height)sem" viewBox="0 0 %(width)s %(height)s" class="diagram">
       %(elements)s
     </svg>
   </div>
@@ -654,7 +654,7 @@ _DIAGRAM_TEMPLATE = """
 
 _BOX_TEMPLATE = """
 <rect x="%(x)s" y="%(y)s" width="%(width)s" height="%(height)s" class="box"></rect>
-<foreignObject x="%(x)s" y="%(y)s" width="%(width)s" height="%(height)s" position="static">
+<foreignObject x="%(x)s" y="%(y)s" width="%(width)s" height="%(height)s">
   <div xmlns="http://www.w3.org/1999/xhtml" class="boxbody">%(contents)s</div>
 </foreignObject>
 """
@@ -673,10 +673,10 @@ _PATH_TEMPLATE = """
 
 
 def to_x(v):
-  return 10 * v * DiagramBlock.VERT_PER_HORZ
+  return v * DiagramBlock.VERT_PER_HORZ
 
 def to_y(v):
-  return 10 * v
+  return v
 
 
 class DiagramBlock(object):

@@ -9,6 +9,7 @@
   fill: white;
   stroke: black;
   stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
 }
 
 .linesboxes .boxbody {
@@ -18,15 +19,18 @@
   padding-bottom: 2px;
   overflow: hidden;
   font-size: 10pt;
+  vector-effect: non-scaling-stroke;
 }
 
 .linesboxes .tablerow, .linesboxes .tablecol {
   stroke-width: 1px;
   stroke: black;
+  vector-effect: non-scaling-stroke;
 }
 
 .linesboxes .path {
   stroke: black;
   stroke-width: 1px;
   fill: none;
+  vector-effect: non-scaling-stroke;
 }
