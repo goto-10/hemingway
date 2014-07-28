@@ -74,7 +74,7 @@
 
 
 import argparse
-import glob
+import glob2
 import logging
 import linesboxes.diagram
 import linesboxes.dom
@@ -318,13 +318,23 @@ class SourceIndex(object):
       self.root += os.sep
     for pattern in self.patterns:
       path = os.path.join(self.root, pattern)
-      for rootpath in glob.glob(path):
+      for rootpath in glob2.glob(path):
         if not rootpath.startswith(self.root):
           raise AssertionError("Found %s under %s?" % (rootpath, self.root))
         relpath = rootpath[len(self.root):]
         abspath = os.path.abspath(rootpath)
         sources[abspath] = SourceFile(relpath, abspath)
     self.sources = sources
+
+  ## Given two paths, a target and an input, returns the input with any paths
+  ## prefixes shared between the two removed.
+  def make_relative(self, target, input):
+    target_parts = target.split(os.path.sep)
+    input_parts = input.split(os.path.sep)
+    while len(target_parts) != 0 and len(input_parts) != 0 and target_parts[0] == input_parts[0]:
+      target_parts = target_parts[1:]
+      input_parts = input_parts[1:]
+    return os.path.sep.join(input_parts)
 
   ## ### Resolving cross references
   ##
@@ -341,8 +351,7 @@ class SourceIndex(object):
       if source.relpath.endswith(name):
         target_out = source.get_relative_output_path()
         asking_out = whos_asking.get_relative_output_path()
-        prefix = os.path.commonprefix([target_out, asking_out])
-        return target_out[len(prefix):]
+        return self.make_relative(asking_out, target_out)
     return None
 
 
@@ -777,10 +786,27 @@ class DiagramBlock(object):
 ## defaults there are some hardcoded overrides, and longer term it should be
 ## possible to specify custom overrides probably via YAML.
 
+# The fallback comment syntax to use if we can't determine the syntax from the
+# language.
+_FALLBACK_COMMENT = r"#.*$"
+
+_C_STYLE_COMMENT = r"//.*$"
+
 _LANGUAGE_OVERRIDES = {
   "C": {
-    "comments": [r"//.*$"]
+    "comments": [_C_STYLE_COMMENT]
+  },
+  "C++": {
+    "comments": [_C_STYLE_COMMENT]
+  },
+  "MarkDown": {
+    "comments": [r"########.*$"],
+    "marker": ""
   }
+}
+
+_FILE_OVERRIDES = {
+  ".md": "MarkDown"
 }
 
 # Collection of information needed to process a file in a particular language.
@@ -836,22 +862,26 @@ class LanguageInfo(object):
   # by querying pygments.
   @staticmethod
   def for_file(filename):
-    lexer = pygments.lexers.get_lexer_for_filename(filename)
-    return LanguageInfo.for_lexer(lexer)
+    (root, ext) = os.path.splitext(filename)
+    file_override = _FILE_OVERRIDES.get(ext, None)
+    if file_override is None:
+      lexer = pygments.lexers.get_lexer_for_filename(filename)
+      return LanguageInfo.for_lexer(lexer)
+    else:
+      return LanguageInfo.for_lexer(None, file_override)
 
   cache = {}
 
   # Returns a language descriptor for the given pygments lexer. If no language
   # can be constructed None is returned.
   @staticmethod
-  def for_lexer(lexer):
+  def for_lexer(lexer, name=None):
     marker = None
-    comments = None
+    comments = []
     overrides = None
     ignore = None
     diagram = None
-    # Grab the name if possible.
-    if hasattr(lexer, 'name'):
+    if (name is None) and hasattr(lexer, 'name'):
       name = lexer.name
       # Now that we have the name check if we've created this language info
       # before.
@@ -859,40 +889,38 @@ class LanguageInfo(object):
         return LanguageInfo.cache[name]
       else:
         LanguageInfo.cache[name] = None
-    else:
-      name = None
     # Prime the variables with the overrides -- if the values are set we don't
     # do any work below to try to infer them.
     overrides = _LANGUAGE_OVERRIDES.get(name, None)
     if not overrides is None:
-      comments = overrides.get("comments", None)
+      comments += [(c, False) for c in overrides.get("comments", [])]
       marker = overrides.get("marker", None)
       ignore = overrides.get("ignore", None)
       diagram = overrides.get("diagram", None)
-    if comments is None:
-      # If comments haven't been set explicitly and the lexer doesn't have
-      # tokens (that we can see) we have to give up.
-      if not hasattr(lexer, 'tokens'):
-        return None
-      comments = []
+    # In addition to the overrides we'll consider the lexer's tokens (if it has
+    # any).
+    if hasattr(lexer, 'tokens'):
       for matcher in LanguageInfo.flatten_list_dicts(lexer.tokens):
         if not isinstance(matcher, tuple):
           continue
         action = matcher[1]
         if action in pygments.token.Comment:
-          comments.append(matcher[0])
-    if (marker is None) or (ignore is None):
-      # If the initial hasn't been set explicitly try to infer it from the
-      # comments.
-      for comment in comments:
-        initial = LanguageInfo.initial_from_regexp(comment)
-        if not initial is None:
-          if marker is None:
-            marker = LanguageInfo.marker_from_initial(initial)
-          if ignore is None:
-            ignore = LanguageInfo.ignore_from_initial(initial)
-          if diagram is None:
-            diagram = LanguageInfo.diagram_from_initial(initial)
+          comments.append((matcher[0], False))
+    comments.append((_FALLBACK_COMMENT, True))
+    initial = None
+    for (comment, is_fallback) in comments:
+      initial = LanguageInfo.initial_from_regexp(comment)
+      if not initial is None:
+        comments = initial
+        if is_fallback:
+          logging.info("Comment syntax couldn't be determined for %s. Using fallback '#'." % name)
+        break
+    if marker is None:
+      marker = LanguageInfo.marker_from_initial(comments)
+    if ignore is None:
+      ignore = LanguageInfo.ignore_from_initial(comments)
+    if diagram is None:
+      diagram = LanguageInfo.diagram_from_initial(comments)
     result = LanguageInfo(lexer, marker, ignore, diagram)
     if not name is None:
       LanguageInfo.cache[name] = result

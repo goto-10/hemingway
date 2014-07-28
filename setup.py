@@ -15,7 +15,6 @@ setuptools.setup(
       'hemingway = hemingway.main:main',
     ]
   },
-  install_requires = ['markdown', 'pygments'],
-  extras_require = {'watchdog': 'watchdog'},
+  install_requires = ['markdown', 'pygments', 'watchdog', 'glob2'],
   include_package_data = True
 )
